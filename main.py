@@ -16,7 +16,7 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.profilers import PyTorchProfiler
 from pytorch_lightning.strategies import DDPStrategy
-from callbacks import CodebookTSNELogger
+from callbacks import CodebookTSNELogger, CodebookUsageLogger
 
 from util import *
 
@@ -45,6 +45,7 @@ def get_callbacks(opt, logdir, ckptdir, config, lightning_config, now):
         "log_ckpt_frequency": opt.log_ckpt_frequency,
         "increase_log_steps": opt.increase_log_steps,
         "tsne_epoch_frequency": opt.tsne_epoch_frequency,
+        "indices_used_frequency": opt.indices_used_frequency,
         "bar_refresh_rate": 100 if os.environ.get("SLURM_JOB_ID") else 1,
     }
     
@@ -151,6 +152,11 @@ def get_parser(**parser_kwargs):
     )
     parser.add_argument(
         "--tsne_epoch_frequency", 
+        type=int, 
+        default=0.5,
+    )
+    parser.add_argument(
+        "--indices_used_frequency", 
         type=int, 
         default=0.5,
     )
@@ -321,6 +327,7 @@ if __name__ == "__main__":
     trainer_kwargs["callbacks"] = get_callbacks(opt, logdir, ckptdir, config, lightning_config, now)
     if opt.tsne_epoch_frequency is not None and opt.tsne_epoch_frequency > 0:
         trainer_kwargs["callbacks"].append(CodebookTSNELogger(epoch_frequency=opt.tsne_epoch_frequency))
+        trainer_kwargs["callbacks"].append(CodebookUsageLogger(log_batches_training=opt.indices_used_frequency))
         
     trainer = Trainer(**trainer_kwargs)
     

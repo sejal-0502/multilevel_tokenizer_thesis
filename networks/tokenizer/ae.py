@@ -988,4 +988,129 @@ class Decoder(nn.Module):
         h = self.conv_out(h)
 
         return h
+
+class Decoder_1d(nn.Module):
+    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks, patch_size, num_extra_tokens,
+                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
+                 resolution, z_channels, give_pre_end=False, **ignorekwargs):
+        super().__init__()
+        self.ch = ch
+        self.temb_ch = 0
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.give_pre_end = give_pre_end
+        self.patch_size = patch_size
+        self.num_extra_tokens = num_extra_tokens
+
+        scale = z_channels ** -0.5
+        self.grid_size = self.resolution // self.patch_size
+        self.mask_tokens = nn.Parameter(scale * (torch.randn(1, 1, z_channels)))
+        self.pos_embeds = nn.Parameter(scale * (torch.randn(self.grid_size ** 2, z_channels)))
+        self.latents_pos_embed = nn.Parameter(scale * torch.randn(self.num_extra_tokens, z_channels)) 
+
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        in_ch_mult = (1,)+tuple(ch_mult)
+        block_in = ch*ch_mult[self.num_resolutions-1]
+        
+        curr_res_h, curr_res_w = (resolution[0] // 2**(self.num_resolutions-1), resolution[1] // 2**(self.num_resolutions-1)) if isinstance(resolution, (list, tuple, ListConfig)) else (resolution// 2**(self.num_resolutions-1) ,resolution// 2**(self.num_resolutions-1))        
+        self.z_shape = (1,z_channels,curr_res_h,curr_res_w)
+
+        # z to block_in
+        self.conv_in = torch.nn.Conv2d(z_channels,
+                                       block_in,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+        
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks+1):
+                block.append(ResnetBlock(in_channels=block_in,
+                                         out_channels=block_out,
+                                         temb_channels=self.temb_ch,
+                                         dropout=dropout))
+                block_in = block_out
+                if curr_res_h in attn_resolutions:
+                    attn.append(AttnBlock(block_in))
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = Upsample(block_in, resamp_with_conv)
+                curr_res_h = curr_res_h * 2
+            self.up.insert(0, up) # prepend to get consistent order
+
+        # end
+        self.norm_out = Normalize(block_in)
+        self.conv_out = torch.nn.Conv2d(block_in,
+                                        out_ch,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=1)
+
+    def forward(self, z):
+        B, N, D = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # mask tokens
+        mask_tokens = self.mask_tokens.repeat(B, self.grid_size**2, 1).to(z.dtype)
+        mask_tokens = mask_tokens + self.pos_embeds
+
+        z = z + self.latents_pos_embed[:N]
+
+        z = torch.cat([mask_tokens, z], dim=1)
+        z = z.permute(0, 2, 1)
+        z = z.unsqueeze(-1)
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h, temb)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h, temb)
+
+        batchsize, channels, tokens, _ = h.shape
+        h = h.reshape(batchsize, tokens, channels*_).permute(0, 2, 1)
+        h = h[:, :self.grid_size**2]
+        h = h.permute(0, 2, 1).reshape(batchsize, channels, self.grid_size, self.grid_size)
+
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks+1):
+                h = self.up[i_level].block[i_block](h, temb)
+                if len(self.up[i_level].attn) > 0:
+                    h = self.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.up[i_level].upsample(h)
+
+        # end
+        if self.give_pre_end:
+            return h
+
+        h = self.norm_out(h)
+        h = nonlinearity(h)
+        h = self.conv_out(h)
+
+        return h
     

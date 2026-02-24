@@ -15,9 +15,7 @@ logs_wm/orbis_288x512
 *.sbatch
 
 # Ignore multiple .yaml version
-configs/stage1_jepa075.yaml
-configs/mae.yaml
-configs/mae_075.yaml
+configs/*.yaml
 
 # Ignore py_cache
 module/__pycache__

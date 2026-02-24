@@ -141,7 +141,11 @@ class Jepa(pl.LightningModule):
                 return step/warmup_steps
             # After warmup_steps, we just return 1. This could be modified to implement your own schedule
             else:
-                return 1.0  
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                decayed = (1 - min_lr) * cosine_decay + min_lr
+                return decayed
+              
         return LambdaLR(optimizer, lr_lambda)
 
     def configure_optimizers(self):
@@ -229,3 +233,64 @@ class Jepa(pl.LightningModule):
         log["inputs"] = x
         log["reconstructions"] = xrec
         return log
+    
+class Jepa_aplhaScheduler(Jepa):
+    """
+    Alpa scheduled version of weak jepa
+    """
+    def __init__(
+        self,
+        ema_momentum,
+        alpha_start,
+        alpha_end,
+        context_encoder_config,
+        target_encoder_config,
+        quantizer_config,
+        decoder_config,
+        loss_config,
+        grad_acc_steps=1,
+        cont_ratio_trainig= 0.0,
+        ignore_keys=None,
+        monitor=None,
+        entropy_loss_weight_scheduler_config=None,
+        min_lr_multiplier=0.1,
+        only_decoder=False,
+        scale_equivariance=None,
+        
+    ):
+        super().__init__(ema_momentum, context_encoder_config, target_encoder_config, quantizer_config, 
+                         decoder_config, loss_config, grad_acc_steps, cont_ratio_trainig, ignore_keys,
+                         monitor, entropy_loss_weight_scheduler_config, min_lr_multiplier, 
+                         only_decoder, scale_equivariance,)
+        
+        self.alpha_start = alpha_start
+        self.alpha_end = alpha_end
+        self.alpha_ramp_step = None
+        self.alpha_ramp_rate = None
+
+    def on_train_start(self):    
+        step_per_epoch = len(self.trainer.train_dataloader)
+        optimizer_step_per_epoch = step_per_epoch // self.grad_acc_steps
+        self.alpha_ramp_step = optimizer_step_per_epoch * 4                 # ramp over 4 epochs
+        self.alpha_ramp_rate = (self.alpha_end - self.alpha_start) / self.alpha_ramp_step
+        return self.alpha_ramp_rate
+
+    def get_alpha(self):
+        """Return current alpha based on global_step (optimizer step)."""
+        if self.alpha_ramp_rate is None or self.alpha_start is None:
+            return self.alpha_start if self.alpha_start is not None else 0.0
+        
+        alpha = self.alpha_start + self.global_step * self.alpha_ramp_rate
+        return min(alpha, self.alpha_end)
+        
+    def forward(self, input):
+        alpha = self.get_alpha()
+        cb_losses, context = self.context_encode(input)
+        with torch.no_grad():
+            target = self.target_encode(input)
+        context_enc = context * alpha + context.detach() * (1 - alpha) 
+        rec = self.decode(context_enc)
+
+        self.log("train/alpha", alpha, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+    
+        return rec, (cb_losses['quantization_loss'], cb_losses['entropy_loss']), context, target

@@ -353,6 +353,50 @@ class VQModel_multiframes(pl.LightningModule):
         log["reconstruction_t+1"] = xrec
         return log
 
+class VQModel_multiframes_1d(VQModel_multiframes):
+    """
+    VQGAN model: vector-quantized autoencoder with adversarial training.
+    """
+    def __init__(
+        self,
+        encoder_config,
+        decoder_config,
+        quantizer_config,
+        loss_config,
+        grad_acc_steps=1,
+        cont_ratio_trainig= 0.0,
+        ignore_keys=None,
+        monitor=None,
+        entropy_loss_weight_scheduler_config=None,
+        min_lr_multiplier=0.1,
+        only_decoder=False,
+        scale_equivariance=None,
+    ):
+        super().__init__(encoder_config, decoder_config, quantizer_config, loss_config, grad_acc_steps,
+                         cont_ratio_trainig, ignore_keys, monitor, entropy_loss_weight_scheduler_config,
+                         min_lr_multiplier, only_decoder, scale_equivariance,)       
+
+        # Convolutional layers for quantization
+        self.quant_conv = nn.Linear(encoder_config.params["z_channels"], quantizer_config.params["e_dim"])
+        self.post_quant_conv = nn.Linear(quantizer_config.params["e_dim"], decoder_config.params["z_channels"])
+    
+    def encode(self, x1, x2):
+        h = self.encoder(x1, x2)
+        h = self.quant_conv(h)
+        h = h.permute(0, 2, 1)
+        if self.encoder_normalize_embedding:
+            h = F.normalize(h, p=2, dim=1)
+        h = h.unsqueeze(2)                  # [B, C, 1, N]
+        ret = self.quantize(h)
+        ret["quantized"] = ret["quantized"].squeeze(2).permute(0, 2, 1) # [B, N, C]
+        return ret
+    
+    def decode(self, quant):
+        # distill_conv_out = self.post_quant_conv_distill(quant)
+        quant2 = self.post_quant_conv(quant)
+        rec = self.decoder(quant2)
+        return rec
+
 
 class VQModelIF(VQModel):
     """

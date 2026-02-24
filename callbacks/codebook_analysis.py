@@ -23,7 +23,9 @@ class CodebookUsageLogger(Callback):
     def setup(self, trainer: Trainer, pl_module: pl.LightningModule, stage: str) -> None:
         # setup fwd hook to collect indices
         def quantizer_hook_fn(module, x, y):
-            _, _, info = y
+            # _, _, info = y
+            quant = y
+            info = quant["indices"]
             if isinstance(info[2], tuple):
                 self.hook_dict["indices"] = info[2][0].cpu().numpy()
                 self.hook_dict["indices2"] = info[2][1].cpu().numpy()
@@ -56,7 +58,7 @@ class CodebookUsageLogger(Callback):
         self.used_indices_val = set()
         
 class CodebookTSNELogger(Callback):
-    def __init__(self, epoch_frequency, num_embeddings_to_plot=16384):
+    def __init__(self, epoch_frequency, num_embeddings_to_plot=4096):
         self.epoch_frequency = epoch_frequency
         self.num_embeddings_to_plot = num_embeddings_to_plot
         self.embeddings_list = []
@@ -84,10 +86,12 @@ class CodebookTSNELogger(Callback):
         from sklearn.manifold import TSNE
         tsne = TSNE(n_components=2, verbose=1, perplexity=40)
         embeddings = torch.cat(self.embeddings_list, dim=0)
+        print("Shape of embeddings : ", embeddings.shape)
         if "Multires" in pl_module.__class__.__name__:
             codewords = pl_module.quantize[0].embedding.weight.cpu()
         else:
             codewords = pl_module.quantize.embedding.weight.cpu()
+        print("Shape of codeworks : ", codewords.shape)
         all_vectors = torch.cat([embeddings, codewords], dim=0)
         tsne_results = tsne.fit_transform(all_vectors)
         tsne_embeddings, tsne_codewords = tsne_results[:len(embeddings)], tsne_results[len(embeddings):]

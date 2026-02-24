@@ -79,14 +79,14 @@ data:
     train:
       target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFixedFrameRate
       params:
-        hdf5_paths_file: /pfs/work9/workspace/scratch/fr_sm793-hierabis/data/h5_files/train/day_clear/10hz/train_10hz_small.txt
+        hdf5_paths_file: /work/dlclarge2/mutakeks-titok/Thesis/dataset_bdd100k/h5_data/train_10hz_small.txt
         size: 256
-        num_frames: 2
+        num_frames: 1
         frame_rate: 10
     validation:
       target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFixedFrameRate
       params:
-        hdf5_paths_file: /pfs/work9/workspace/scratch/fr_sm793-hierabis/data/h5_files/val/day_clear/10hz/val_10hz.txt
+        hdf5_paths_file: /work/dlclarge2/mutakeks-titok/Thesis/dataset_bdd100k/h5_data/val_10hz.txt
         size: 256
-        num_frames: 2
+        num_frames: 1
         frame_rate: 10
