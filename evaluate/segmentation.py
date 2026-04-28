@@ -234,7 +234,7 @@ def prepare_feature_cache(
         imgs = imgs.to(device, non_blocking=True)
         labels_encoded = encode_segmap(labels).cpu()
 
-        feats_dict = model.encode(imgs)
+        feats_dict = model.encoder(imgs)
         feats = feats_dict["continuous"] if isinstance(feats_dict, dict) else feats_dict
         
         feats = torch.cat((feats[0], feats[1]), dim=1) if isinstance(feats, tuple) else feats
@@ -421,14 +421,18 @@ def calculate_semantic(args: argparse.Namespace, unknown_args: Sequence[str]) ->
                 if use_cache:
                     logits = linear_probe(x, target_size=label.shape[-2:])
                 else:
-                    feats = model.encoder(x)
-                    # feats = feats["continuous"] if isinstance(feats, dict) else feats
+                    if args.num_input_frames > 1:
+                        feats = model.encoder(x, x)
+                    else:
+                        feats = model.encoder(x)
+                    
                     feats = torch.cat((feats[0], feats[1]), dim=1) if isinstance(feats, tuple) else feats
                     logits = linear_probe(feats, target_size=label.shape[-2:])
 
                 pred = logits.argmax(dim=1)[0]
 
-                gt_rgb = colorize(label[0])
+                gt_safe = encode_segmap(label[0])
+                gt_rgb = colorize(gt_safe)
                 pred_rgb = colorize(pred)
 
                 # HWC → CHW and normalize to [0,1]
@@ -467,10 +471,11 @@ def calculate_semantic(args: argparse.Namespace, unknown_args: Sequence[str]) ->
                     # map original Cityscapes IDs -> train IDs, keep IGNORE_INDEX intact
                     labels = encode_segmap(labels)
 
-                    feats = model.encoder(imgs)
-                    # print("Shape of feats : ", feats.shape)
-                    # feats = feats_dict["continuous"] if isinstance(feats_dict, dict) else feats_dict  # (B,C,h,w)
-                            
+                    if args.num_input_frames > 1:
+                        feats = model.encoder(imgs, imgs)
+                    else:
+                        feats = model.encoder(imgs)
+                                                
                     feats = torch.cat((feats[0], feats[1]), dim=1) if isinstance(feats, tuple) else feats
 
                     logits = linear_probe(feats.detach(), target_size=labels.shape[-2:])
@@ -582,6 +587,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed (<=0 disables repeatability)")
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"], help="cpu | cuda")
     parser.add_argument("--dump_vis", type=str2bool, default=True, help="Dump colored GT/pred PNGs during eval")
+    parser.add_argument("--num_input_frames", type=int, default=1, help="Number of input frames in backbone model")
 
     args, unknown = parser.parse_known_args(argv)
 

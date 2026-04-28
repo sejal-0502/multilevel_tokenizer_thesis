@@ -797,8 +797,12 @@ class DiT(nn.Module):
             t: (N,) tensor of diffusion timesteps
             y: (N,) tensor of class labels
             """
-            
-            num_frames_ctx = context.size(1)
+
+            if context is not None:
+                num_frames_ctx = context.size(1)
+            else:
+                num_frames_ctx = 0
+                
             num_frames_pred = target.size(1)
             
             c = self.get_condition_embeddings(t)
@@ -809,11 +813,12 @@ class DiT(nn.Module):
             features = []
             for block in self.blocks:
                 x = block(x, c)
-                features.append(x) if return_features else None
+                features.append(x) if return_features else None            
             x = rearrange(x,  'b (f hw) c -> b f hw c', f=(num_frames_ctx+num_frames_pred))[:,-num_frames_pred:]
             out = self.final_layer(x, c)
                         
             out = self.postprocess_outputs(out)
+
             if return_features:
                 return out, features
             return out

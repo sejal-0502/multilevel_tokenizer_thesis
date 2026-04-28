@@ -12,9 +12,10 @@ class CodebookUsageLogger(Callback):
     """
     Track unique codebook indices used by a vector-quantizer during training/validation.
     """
-    def __init__(self, log_batches_training: bool = False):
+    def __init__(self, log_batches_training: bool = False, quantizer_attr: str = "quantize"):
         super().__init__()
         self.log_batches_training = log_batches_training
+        self.quantizer_attr = quantizer_attr
         self.used_indices_train = set()
         self.used_indices_val = set()
         self.hook_dict = {}
@@ -22,6 +23,7 @@ class CodebookUsageLogger(Callback):
 
     def setup(self, trainer: Trainer, pl_module: pl.LightningModule, stage: str) -> None:
         # setup fwd hook to collect indices
+        quantizer = getattr(pl_module, self.quantizer_attr)
         def quantizer_hook_fn(module, x, y):
             # _, _, info = y
             quant = y
@@ -32,17 +34,17 @@ class CodebookUsageLogger(Callback):
             else:
                 self.hook_dict["indices"] = info[2].cpu().numpy()
         
-        if isinstance(pl_module.quantize, torch.nn.ModuleList):
-            self.hook_handle = pl_module.quantize[0].register_forward_hook(quantizer_hook_fn)
+        if isinstance(quantizer, torch.nn.ModuleList):
+            self.hook_handle = quantizer[0].register_forward_hook(quantizer_hook_fn)
         else:
-            self.hook_handle = pl_module.quantize.register_forward_hook(quantizer_hook_fn)
+            self.hook_handle = quantizer.register_forward_hook(quantizer_hook_fn)
 
     # update logger's counter after iter, log for batch if requested
     def on_train_batch_end(self, trainer: Trainer, pl_module: pl.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
         used_batch_set = set(self.hook_dict['indices'].flatten())
         self.used_indices_train.update(used_batch_set)
         if self.log_batches_training:
-            pl_module.log("train/indices_used_batch_avg", len(used_batch_set), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+            pl_module.log(f"train/indices_used_batch_avg_{self.quantizer_attr}", len(used_batch_set), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
     def on_validation_batch_end(self, trainer: Trainer, pl_module: pl.LightningModule, outputs:Any, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:
         used_batch_set = set(self.hook_dict['indices'].flatten())
@@ -50,16 +52,18 @@ class CodebookUsageLogger(Callback):
 
     # log and reset counter
     def on_train_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
-        pl_module.log("train/total_indices_used", len(self.used_indices_train), prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        pl_module.log(f"train/total_indices_used_{self.quantizer_attr}", len(self.used_indices_train), prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
         self.used_indices_train = set()
     
     def on_validation_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
-        pl_module.log("val/total_indices_used", len(self.used_indices_val), prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        pl_module.log(f"val/total_indices_used_{self.quantizer_attr}", len(self.used_indices_val), prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
         self.used_indices_val = set()
-        
+
+
 class CodebookTSNELogger(Callback):
-    def __init__(self, epoch_frequency, num_embeddings_to_plot=4096):
+    def __init__(self, epoch_frequency, num_embeddings_to_plot=4096, quantizer_attr: str = "quantize"):
         self.epoch_frequency = epoch_frequency
+        self.quantizer_attr = quantizer_attr
         self.num_embeddings_to_plot = num_embeddings_to_plot
         self.embeddings_list = []
         self.hook_handle = None
@@ -67,13 +71,14 @@ class CodebookTSNELogger(Callback):
     
     def setup(self, trainer: Trainer, pl_module: pl.LightningModule, stage: str) -> None:
         # setup fwd hook to collect embeddings
+        quantizer = getattr(pl_module, self.quantizer_attr)
         def embeddings_hook_fn(module, x, y):
             self.hook_dict["embeddings"] = x[0].detach().cpu()
         
-        if isinstance(pl_module.quantize, torch.nn.ModuleList):
-            self.hook_handle = pl_module.quantize[0].register_forward_hook(embeddings_hook_fn)
+        if isinstance(quantizer, torch.nn.ModuleList):
+            self.hook_handle = quantizer[0].register_forward_hook(embeddings_hook_fn)
         else:
-            self.hook_handle = pl_module.quantize.register_forward_hook(embeddings_hook_fn)
+            self.hook_handle = quantizer.register_forward_hook(embeddings_hook_fn)
     
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if pl_module.current_epoch % self.epoch_frequency == 0:
@@ -84,13 +89,14 @@ class CodebookTSNELogger(Callback):
     
     def get_tsned_projections(self, pl_module):
         from sklearn.manifold import TSNE
+        quantizer = getattr(pl_module, self.quantizer_attr)
         tsne = TSNE(n_components=2, verbose=1, perplexity=40)
         embeddings = torch.cat(self.embeddings_list, dim=0)
         print("Shape of embeddings : ", embeddings.shape)
         if "Multires" in pl_module.__class__.__name__:
-            codewords = pl_module.quantize[0].embedding.weight.cpu()
+            codewords = quantizer[0].embedding.weight.cpu()
         else:
-            codewords = pl_module.quantize.embedding.weight.cpu()
+            codewords = quantizer.embedding.weight.cpu()
         print("Shape of codeworks : ", codewords.shape)
         all_vectors = torch.cat([embeddings, codewords], dim=0)
         tsne_results = tsne.fit_transform(all_vectors)
@@ -120,10 +126,9 @@ class CodebookTSNELogger(Callback):
     def log_tensorboard(self, pl_module):
         tsne_embeddings, tsne_codewords = self.get_tsned_projections(pl_module)
         plot = self.get_plot_as_rgb(tsne_embeddings, tsne_codewords)
-        pl_module.logger.experiment.add_image("TSNE", plot, global_step=pl_module.global_step, dataformats="HWC")
+        pl_module.logger.experiment.add_image(f"TSNE_{self.quantizer_attr}", plot, global_step=pl_module.global_step, dataformats="HWC")
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if pl_module.current_epoch % self.epoch_frequency == 0:
             self.log_tensorboard(pl_module)
         self.embeddings_list = []
-    

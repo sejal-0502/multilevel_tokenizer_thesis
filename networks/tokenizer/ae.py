@@ -5,11 +5,15 @@ from typing import Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+import timm
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from omegaconf import ListConfig
-
+from torchvision.models.optical_flow import raft_small
+from depth_anything_v2.dpt import DepthAnythingV2
+from vggt.vggt.models.vggt import VGGT as VGGTModel
 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
@@ -744,146 +748,147 @@ class Encoder(nn.Module):
         h = self.conv_out(h)
         return h
 
-class Predictor(nn.Module):
-    def __init__(self, predictor_embed_dim: int, depth: int, heads: int, mlp_dim: int, dim_head: int = 64, 
-                 normalize_embedding: bool = True) -> None:
+class Dino(nn.Module):
+    def __init__(self, resolution, patch_size):
+        """
+        dino_model: preloaded dino-v2 model
+        resolution: input image resolution (assume square for simplicity)
+        patch_size: size of each patch for averaging
+        """
         super().__init__()
-
-        self.transformer = Transformer(predictor_embed_dim, depth, heads, dim_head, mlp_dim)
-
-        self.apply(init_weights)
-
-    def forward(self, masked_tokens, pos_embed=None) -> torch.FloatTensor:
-        
-        x = masked_tokens
-
-        if pos_embed is not None:
-            x = x + pos_embed
-
-        x = self.transformer(x) # [B, N, D]
-        
-        return x
-
-class MAE_Decoder(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks, patch_size,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, give_pre_end=False, **ignorekwargs):
-        super().__init__()
-        self.ch = ch
-        self.temb_ch = 0
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        self.in_channels = in_channels
-        self.give_pre_end = give_pre_end
+        self.image_size = resolution
         self.patch_size = patch_size
+        self.scale_factor = 16
 
-        self.num_patches = (resolution // patch_size) ** 2
-        self.mask_tokens = nn.Parameter(torch.randn(1, 1, z_channels))
-        self.pos_embed_dec = nn.Parameter(torch.zeros(1, self.num_patches, z_channels)) 
+        # Load pretrained DINOv2
+        self.dino_model = torch.hub.load(
+            "facebookresearch/dinov2",
+            "dinov2_vitb14"
+        )
+
+        self.dino_model.eval()
+        for p in self.dino_model.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        """
+        x: [B, 3, H, W] tensor
+        """
+        with torch.no_grad():
+            x_resized = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+            # Extract patch tokens
+            features = self.dino_model.forward_features(x_resized)
+            patch_tokens = features["x_norm_patchtokens"]  # [B, N, 768]
+
+        B, N, C = patch_tokens.shape
+        H = W = int(N ** 0.5)
+        patch_tokens = patch_tokens.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        patch_tokens = F.adaptive_avg_pool2d(patch_tokens, output_size=(self.patch_size, self.patch_size))
+
+        patch_tokens = patch_tokens.permute(0,2,3,1).reshape(B, -1, C)
+
+        patch_tokens = F.normalize(patch_tokens, dim=-1)
+
+        return patch_tokens
+
+class DEPTH(nn.Module):
+    def __init__(self, depth_model_path, resolution, patch_size):
+        """
+        depth_model: preloaded Depth Anything model
+        resolution: input image resolution (assume square for simplicity)
+        patch_size: size of each patch for averaging
+        """
+        super().__init__()
+        self.image_size = resolution
+        self.patch_size = patch_size
+        self.scale_factor = 16
+
+        self.depth_model = DepthAnythingV2(
+            encoder="vitb",
+            features=128,
+            out_channels=[96, 192, 384, 768]
+        )
+        state = torch.load(depth_model_path, map_location="cpu")
+        self.depth_model.load_state_dict(state)
+        self.depth_model.eval()
+        for p in self.depth_model.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        """
+        x: [B, 3, H, W] tensor, normalized as required by the depth model
+        """
+        with torch.no_grad():
+            x_resized = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+            depth_map = self.depth_model(x_resized)  # [B, H, W]
+            depth_map = F.interpolate(depth_map.unsqueeze(1), size=(256, 256), mode="bilinear", align_corners=False)
+
+        min_val = depth_map.amin(dim=[1,2,3], keepdim=True)  # per image min
+        max_val = depth_map.amax(dim=[1,2,3], keepdim=True)  # per image max
+
+        # Normalize to [0,1]
+        depth_map = (depth_map - min_val) / (max_val - min_val + 1e-8)
         
-        # compute in_ch_mult, block_in and curr_res at lowest res
-        in_ch_mult = (1,)+tuple(ch_mult)
-        block_in = ch*ch_mult[self.num_resolutions-1]
+        min_val = depth_map.min().item()
+        max_val = depth_map.max().item()
+        # print("min:", min_val, "max:", max_val)
         
-        curr_res_h, curr_res_w = (resolution[0] // 2**(self.num_resolutions-1), resolution[1] // 2**(self.num_resolutions-1)) if isinstance(resolution, (list, tuple, ListConfig)) else (resolution// 2**(self.num_resolutions-1) ,resolution// 2**(self.num_resolutions-1))        
-        self.z_shape = (1,z_channels,curr_res_h,curr_res_w)
+        # patch-wise average pooling
+        H_patch = depth_map.shape[2] // self.patch_size
+        W_patch = depth_map.shape[3] // self.patch_size
+        patch_depth = F.adaptive_avg_pool2d(depth_map, output_size=(H_patch, W_patch))
 
-        # z to block_in
-        self.conv_in = torch.nn.Conv2d(z_channels,
-                                       block_in,
-                                       kernel_size=3,
-                                       stride=1,
-                                       padding=1)
+        B, C, H_t, W_t = patch_depth.shape
+        patch_depth = patch_depth.permute(0, 2, 3, 1).reshape(B, H_t * W_t, C)
 
-        # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch,
-                                       dropout=dropout)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch,
-                                       dropout=dropout)
-        
-        #self.decoder_dino_conv = nn.Conv2d(block_in, 768, kernel_size=1, stride=1, padding=0) # remove hard-coded emb_dim=768
+        return patch_depth  # [B, N_patches, 1]
 
-        # upsampling
-        self.up = nn.ModuleList()
-        for i_level in reversed(range(self.num_resolutions)):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
-            block_out = ch*ch_mult[i_level]
-            for i_block in range(self.num_res_blocks+1):
-                block.append(ResnetBlock(in_channels=block_in,
-                                         out_channels=block_out,
-                                         temb_channels=self.temb_ch,
-                                         dropout=dropout))
-                block_in = block_out
-                if curr_res_h in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
-            up = nn.Module()
-            up.block = block
-            up.attn = attn
-            if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
-                curr_res_h = curr_res_h * 2
-            self.up.insert(0, up) # prepend to get consistent order
+class RAFT_displacement(nn.Module):
+    def __init__(self, resolution, patch_size, scale_factor):
+        super().__init__()
 
-        # end
-        self.norm_out = Normalize(block_in)
-        self.conv_out = torch.nn.Conv2d(block_in,
-                                        out_ch,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
+        self.image_size = resolution
+        self.patch_size = patch_size
+        self.scale_factor = scale_factor
 
-    def forward(self, x, ids_restore):
-        #assert z.shape[1:] == self.z_shape[1:]
-        B, N_visible, D = x.shape
-        N_full = ids_restore.shape[1]
+        self.raft = raft_small(pretrained=True).eval()
+        for p in self.raft.parameters():
+            p.requires_grad = False
 
-        mask_tokens = self.mask_tokens.expand(B, N_full - N_visible, -1)
-        x_full = torch.cat([x, mask_tokens], dim=1) 
-        x = x_full.gather(1, index=ids_restore.unsqueeze(-1).expand(-1, -1, D))  
-        
-        # add pos embed
-        x = x + self.pos_embed_dec
+    def forward(self, x1, x2):
+        """
+        Compute displacement targets from frame1 -> frame2.
 
-        H_dec = W_dec = self.resolution // self.patch_size
-        x = x.reshape(B, H_dec, W_dec, D).permute(0, 3, 1, 2).contiguous()
+        Args:
+            x1, x2: tensors [B, 3, H, W] normalized to [0,1]
 
-        # timestep embedding
-        temb = None
+        Returns:
+            gt_displacement: [B, num_patches, 2], scaled to roughly [0,1]
+        """
+        with torch.no_grad():
+            flow_predictions = self.raft(x1, x2)
+            gt_raft = flow_predictions[-1]  # [B, 2, H, W]
 
-        # z to block_in
-        h = self.conv_in(x)
+        B, C, H, W = gt_raft.shape
 
-        # middle
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        # Patch-wise averaging
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+        h = F.adaptive_avg_pool2d(gt_raft, output_size=(H_patch, W_patch))
 
-        # upsampling
-        for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks+1):
-                h = self.up[i_level].block[i_block](h, temb)
-                if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
-            if i_level != 0:
-                h = self.up[i_level].upsample(h)
-        
-        if self.give_pre_end:
-            return h
+        # Scale to match reconstruction loss magnitude
+        h = h / self.scale_factor  # now roughly ~0–1 if reconstruction is normalized pixels
 
-        h = self.norm_out(h)
-        h = nonlinearity(h)
-        h = self.conv_out(h)
+        # Flatten patches
+        gt_displacement = h.permute(0, 2, 3, 1).reshape(B, H_patch * W_patch, C)  # [B, num_tokens, 2]
 
-        return h
+        return gt_displacement
     
+
+###############################################################################
+# Decoder - MAE, Temporal MAE, Distillation
+###############################################################################
+
 class Decoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
@@ -957,6 +962,7 @@ class Decoder(nn.Module):
 
     def forward(self, z):
         #assert z.shape[1:] == self.z_shape[1:]
+        # print("Shape of z : ", z.shape)
         self.last_z_shape = z.shape
 
         # timestep embedding
@@ -988,9 +994,60 @@ class Decoder(nn.Module):
         h = self.conv_out(h)
 
         return h
+    
+class Decoder_decoderbased(Decoder):
+    def __init__(self, *, resolution, patch_size, z_channels, **kwargs):
+        super().__init__(resolution=resolution, z_channels=z_channels, **kwargs)
 
-class Decoder_1d(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks, patch_size, num_extra_tokens,
+        self.unet_ch = 512
+        self.z_channels = z_channels
+        self.linear_head = nn.Linear(self.unet_ch, self.z_channels)
+
+    def forward(self, z):
+        #assert z.shape[1:] == self.z_shape[1:]
+        self.last_z_shape = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h, temb)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h, temb)
+
+        # print("Shape of h before upsampling : ", h.shape)
+
+        if self.give_pre_end:
+            B, C, H, W = h.shape
+            h_flat = h.permute(0, 2, 3, 1).reshape(B, H*W, C)  # [B, N, C]
+            h_latent = self.linear_head(h_flat)
+            # print("Shape of latent h : ", h_latent.shape)      
+
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks+1):
+                h = self.up[i_level].block[i_block](h, temb)
+                if len(self.up[i_level].attn) > 0:
+                    h = self.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.up[i_level].upsample(h)
+
+        # end
+
+        h = self.norm_out(h)
+        h = nonlinearity(h)
+        h = self.conv_out(h)
+
+        if self.give_pre_end:
+            return h, h_latent
+        else:
+            return h
+
+class Decoder_motion(nn.Module):
+    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, give_pre_end=False, **ignorekwargs):
         super().__init__()
@@ -1001,14 +1058,7 @@ class Decoder_1d(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         self.give_pre_end = give_pre_end
-        self.patch_size = patch_size
-        self.num_extra_tokens = num_extra_tokens
-
-        scale = z_channels ** -0.5
-        self.grid_size = self.resolution // self.patch_size
-        self.mask_tokens = nn.Parameter(scale * (torch.randn(1, 1, z_channels)))
-        self.pos_embeds = nn.Parameter(scale * (torch.randn(self.grid_size ** 2, z_channels)))
-        self.latents_pos_embed = nn.Parameter(scale * torch.randn(self.num_extra_tokens, z_channels)) 
+        self.unet_ch = 512
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -1036,6 +1086,8 @@ class Decoder_1d(nn.Module):
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
         
+        #self.decoder_dino_conv = nn.Conv2d(block_in, 768, kernel_size=1, stride=1, padding=0) # remove hard-coded emb_dim=768
+
         # upsampling
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
@@ -1066,21 +1118,15 @@ class Decoder_1d(nn.Module):
                                         stride=1,
                                         padding=1)
 
+        self.linear_head = nn.Linear(self.unet_ch, 2)
+
+
     def forward(self, z):
-        B, N, D = z.shape
+        #assert z.shape[1:] == self.z_shape[1:]
+        self.last_z_shape = z.shape
 
         # timestep embedding
         temb = None
-
-        # mask tokens
-        mask_tokens = self.mask_tokens.repeat(B, self.grid_size**2, 1).to(z.dtype)
-        mask_tokens = mask_tokens + self.pos_embeds
-
-        z = z + self.latents_pos_embed[:N]
-
-        z = torch.cat([mask_tokens, z], dim=1)
-        z = z.permute(0, 2, 1)
-        z = z.unsqueeze(-1)
 
         # z to block_in
         h = self.conv_in(z)
@@ -1090,11 +1136,174 @@ class Decoder_1d(nn.Module):
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
 
-        batchsize, channels, tokens, _ = h.shape
-        h = h.reshape(batchsize, tokens, channels*_).permute(0, 2, 1)
-        h = h[:, :self.grid_size**2]
-        h = h.permute(0, 2, 1).reshape(batchsize, channels, self.grid_size, self.grid_size)
+        B, C, H, W = h.shape
 
+        h_flat = h.permute(0, 2, 3, 1).reshape(B, H*W, C)  # [B, N, C]
+
+        displacement = self.linear_head(h_flat)            # [B, N, 2]
+
+        return displacement
+
+class Decoder_depth(nn.Module):
+    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
+                 resolution, z_channels, give_pre_end=False, **ignorekwargs):
+        super().__init__()
+        self.ch = ch
+        self.temb_ch = 0
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.give_pre_end = give_pre_end
+        self.unet_ch = 512
+
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        in_ch_mult = (1,)+tuple(ch_mult)
+        block_in = ch*ch_mult[self.num_resolutions-1]
+        
+        curr_res_h, curr_res_w = (resolution[0] // 2**(self.num_resolutions-1), resolution[1] // 2**(self.num_resolutions-1)) if isinstance(resolution, (list, tuple, ListConfig)) else (resolution// 2**(self.num_resolutions-1) ,resolution// 2**(self.num_resolutions-1))        
+        self.z_shape = (1,z_channels,curr_res_h,curr_res_w)
+
+        # z to block_in
+        self.conv_in = torch.nn.Conv2d(z_channels,
+                                       block_in,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+        
+        #self.decoder_dino_conv = nn.Conv2d(block_in, 768, kernel_size=1, stride=1, padding=0) # remove hard-coded emb_dim=768
+
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks+1):
+                block.append(ResnetBlock(in_channels=block_in,
+                                         out_channels=block_out,
+                                         temb_channels=self.temb_ch,
+                                         dropout=dropout))
+                block_in = block_out
+                if curr_res_h in attn_resolutions:
+                    attn.append(AttnBlock(block_in))
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = Upsample(block_in, resamp_with_conv)
+                curr_res_h = curr_res_h * 2
+            self.up.insert(0, up) # prepend to get consistent order
+
+        # end
+        self.norm_out = Normalize(block_in)
+        self.conv_out = torch.nn.Conv2d(block_in,
+                                        out_ch,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=1)
+
+        self.linear_head = nn.Linear(self.unet_ch, 1)              
+
+    def forward(self, z):
+        #assert z.shape[1:] == self.z_shape[1:]
+        self.last_z_shape = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h, temb)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h, temb)
+
+        B, C, H, W = h.shape
+        h_flat = h.permute(0, 2, 3, 1).reshape(B, H*W, C)  # [B, N, C]
+
+        depth = self.linear_head(h_flat)            # [B, N, 1]
+
+        min_val = depth.min().item()
+        max_val = depth.max().item()
+
+        return depth
+
+class Decoder_dino(Decoder):
+    def __init__(self, *, resolution, patch_size, z_channels, **kwargs):
+        super().__init__(resolution=resolution, z_channels=z_channels, **kwargs)
+        
+        self.resolution = resolution
+        self.patch_size = patch_size
+        self.grid_size = self.resolution // self.patch_size
+        self.z_channels = z_channels
+        self.unet_ch = 512
+        self.linear_head = nn.Linear(self.unet_ch, self.z_channels)           
+
+    def forward(self, z):
+        #assert z.shape[1:] == self.z_shape[1:]
+        self.last_z_shape = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h, temb)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h, temb)
+
+        B, C, H, W = h.shape
+        h_flat = h.permute(0, 2, 3, 1).reshape(B, H*W, C)  # [B, N, C]
+
+        student_tokens = self.linear_head(h_flat)            # [B, N, 768]
+
+        student_tokens = F.normalize(student_tokens, dim=-1)
+
+        return student_tokens
+        
+###############################################################################
+# Decoder : Temporal Compression
+###############################################################################    
+
+class Decoder_2dgrid(Decoder):
+    def __init__(self, *, resolution, patch_size, z_channels, **kwargs):
+        super().__init__(resolution=resolution, z_channels=z_channels, **kwargs)
+        
+        self.resolution = resolution
+        self.patch_size = patch_size
+        self.grid_size = self.resolution // self.patch_size
+        self.num_latent_tokens = self.grid_size**2
+        self.num_patches_f1 = self.grid_size**2
+        self.num_patches_f2 = self.grid_size**2
+
+        scale = z_channels ** -0.5
+        
+        self.mask_tokens = nn.Parameter(scale * (torch.randn(1, 1, z_channels)))
+        self.pos_embeds = nn.Parameter(scale * (torch.randn(self.grid_size ** 2, z_channels)))
+        self.latents_pos_embed = nn.Parameter(scale * (torch.randn(self.grid_size ** 2, z_channels)))
+        self.temporal_embed = nn.Parameter(scale * (torch.randn(2, z_channels))) 
+
+        
+    def upsample(self, h, temb):
+        B, D, H, W = h.shape
+        h = h.reshape(B, D, self.grid_size, self.grid_size)
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks+1):
@@ -1113,4 +1322,42 @@ class Decoder_1d(nn.Module):
         h = self.conv_out(h)
 
         return h
+
+    def forward(self, z):
+        B, D, H, W = z.shape
+
+        temb = None
+
+        # mask tokens f1
+        mask_tokens_f1 = self.mask_tokens.expand(B, self.grid_size**2, -1)
+        mask_tokens_f1 = mask_tokens_f1 + self.pos_embeds.to(mask_tokens_f1.dtype)
+        mask_tokens_f1 = mask_tokens_f1 + self.temporal_embed[0]
+
+        # mask tokens f2
+        mask_tokens_f2 = self.mask_tokens.expand(B, self.grid_size**2, -1)
+        mask_tokens_f2 = mask_tokens_f2 + self.pos_embeds.to(mask_tokens_f2.dtype)
+        mask_tokens_f2 = mask_tokens_f2 + self.temporal_embed[1]
+
+        z = z.reshape(B, D, H*W).permute(0, 2, 1)
+        z = z + self.latents_pos_embed.to(z.dtype)       
+
+        z = torch.cat([z, mask_tokens_f1, mask_tokens_f2], dim=1)
+        z = z.permute(0, 2, 1).unsqueeze(-1)                        # [B, D, N, 1]
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h, temb)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h, temb)
+
+        h = h[:, :, self.num_latent_tokens:, :]
+        h1 = h[:, :, :self.num_patches_f2, :]
+        h2 = h[:, :, self.num_patches_f1:, :]
+
+        h1 = self.upsample(h1, temb)
+        h2 = self.upsample(h2, temb)
+
+        return h1, h2
     

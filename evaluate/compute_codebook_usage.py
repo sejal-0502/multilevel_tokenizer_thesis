@@ -39,6 +39,16 @@ try:
 except ImportError:
   print("Depth-Anything not found")
 
+def str2bool(v: str | bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    val = v.lower()
+    if val in {"yes", "true", "t", "y", "1"}:
+        return True
+    if val in {"no", "false", "f", "n", "0"}:
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
 def load_config(config_path, display=False):
   config = OmegaConf.load(config_path)
   if display:
@@ -75,19 +85,59 @@ def preprocess_vqgan(x):
   return x
 
 def unnormalize_vqgan(x):
+  #  print("Shape of x : ", x.shape)
    B, C, H, W = x.shape
    x = x.reshape(B*C, H, W).permute(1, 2, 0)
    if isinstance(x, torch.Tensor):
      x = x.cpu().detach().numpy()
    image = ((x+1)*127.5).astype(np.uint8)
+   if image.shape[-1] > 3:
+      image = image[:, :, 3:]
    return image
+
+@torch.no_grad()
+def generate_images_for_gfid(gen_model, num_images, save_dir, batch_size=16):
+    os.makedirs(save_dir, exist_ok=True)
+
+    idx = 0
+    while idx < num_images:
+        cur_bs = min(batch_size, num_images - idx)
+
+        # sample from noise (NO conditioning)
+        _, images = gen_model.sample(
+            images=None,
+            latent=False,
+            eta=0.0,
+            NFE=30,
+            sample_with_ema=True,
+            num_samples=cur_bs
+        )
+
+        # images: [B, 1, C, H, W]
+        images = images[:, 0]  # take first frame
+
+        for i in range(cur_bs):
+            save_image(images[i], os.path.join(save_dir, f"{idx+i}.png"))
+
+        idx += cur_bs
 
 def reconstruct_with_vqgan(x, model, hist, codebook_size):
     # could also use model(x) for reconstruction but use explicit encoding and decoding here
-    if args.num_input_frames > 1:
-        output = model.encode(x, x)
+    if args.loss_supervision:
+       if args.num_input_frames > 1:
+          output_spatial, output_supervision = model.encode(x, x)
+          output = output_spatial
+       else:
+          output_spatial, output_supervision = model.encode(x)
+          output = output_spatial
+    elif args.auxiliary_depth:
+        output_spatial, output_depth = model.encode(x)
+        output = output_spatial
     else:
-        output = model.encode(x)
+      if args.num_input_frames > 1:
+          output = model.encode(x, x)
+      else:
+          output = model.encode(x)
     codes = output["quantized"]
     indices = output["indices"]
     # print("Shape of indices : ", indices.shape)
@@ -180,9 +230,7 @@ def create_index_visualization(img, indices, codes, patch_size, colors, save_dir
     :param patch_size: The size of the patch.
     :return: The visualization.
     """
-    # convert shape from (3, 224, 224) to (224, 224, 3)
-    # img = (img * 255).astype(np.uint8)
-    # img = np.transpose(img, (1, 2, 0))
+
     original_size = img.shape[:2]
     upscaled_size = (original_size[0] * upscale_factor, original_size[1] * upscale_factor)
     pil_img = Image.fromarray(img).resize(upscaled_size, resample=PIL.Image.NEAREST)
@@ -423,9 +471,12 @@ if __name__ == "__main__":
   parser.add_argument("--save_patches_by_index", action="store_true", help="Save patches by index")
   parser.add_argument("--compute_rFID_score", action="store_true", help="Compute rFID score")
   parser.add_argument("--num_images", type=int, default=1000, help="Number of images to process")
-  parser.add_argument("--codebook_size", type=int, default=1024, help="Number of images to process")
+  parser.add_argument("--codebook_size", type=int, default=4096, help="Number of images to process")
   parser.add_argument("--num_input_frames", type=int, default=1, help="Number of input frames")
   parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
+  parser.add_argument("--loss_supervision", type=str2bool, default=False)
+  parser.add_argument("--auxiliary_depth", type=str2bool, default=False, help="For depth supervision loss model")
+
   args = parser.parse_args()
   
   if (args.config_path is None or args.ckpt_path is None):

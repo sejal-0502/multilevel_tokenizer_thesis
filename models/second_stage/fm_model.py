@@ -90,18 +90,55 @@ class Model(pl.LightningModule):
         """
         Instantiate the tokenizer model from the config.
         """
+        print(f"DEBUG: Tokenizer Config Keys: {tokenizer_config.keys()}", flush=True)
+        finetune_path = getattr(tokenizer_config, "decoder_finetune_ckpt", None)
         
         tokenizer_folder = os.path.expandvars(tokenizer_config.folder)
         ckpt_path = tokenizer_config.ckpt_path if tokenizer_config.ckpt_path else "checkpoints/last.ckpt"
         # Load config and create
-        tokenizer_config = OmegaConf.load(os.path.join(tokenizer_folder, "config.yaml"))
-        model = instantiate_from_config(tokenizer_config.model)
+        disk_config = OmegaConf.load(os.path.join(tokenizer_folder, "config.yaml"))
+        model = instantiate_from_config(disk_config.model)
         # Load checkpoint
         checkpoint = torch.load(os.path.join(tokenizer_folder, ckpt_path), map_location="cpu", weights_only=True)["state_dict"]
         model.load_state_dict(checkpoint, strict=False)
-        model.eval()
 
+
+        if finetune_path is not None:
+            print(f"[Tokenizer] Loading fine-tuned decoder from: {finetune_path}", flush=True)
+            ft_ckpt = torch.load(finetune_path, map_location="cpu")
+
+            # 1. Extract the state_dict if it's a full Lightning checkpoint
+            if "state_dict" in ft_ckpt:
+                new_state_dict = ft_ckpt["state_dict"]
+            else:
+                new_state_dict = ft_ckpt
+
+            # 2. Filter for decoder keys and strip the "decoder." prefix
+            # This maps "decoder.conv_in.weight" -> "conv_in.weight"
+            decoder_state_dict = {}
+            for k, v in new_state_dict.items():
+                if k.startswith("decoder."):
+                    decoder_state_dict[k.replace("decoder.", "")] = v
+                # If your checkpoint doesn't have the prefix, just take the keys directly
+                elif k in model.decoder.state_dict():
+                    decoder_state_dict[k] = v
+
+            # 3. Load into the decoder
+            model.decoder.load_state_dict(decoder_state_dict, strict=True)
+
+            # 4. Do the same for post_quant_conv if it exists
+            pq_state_dict = {}
+            for k, v in new_state_dict.items():
+                if k.startswith("post_quant_conv."):
+                    pq_state_dict[k.replace("post_quant_conv.", "")] = v
+            
+            if pq_state_dict:
+                model.post_quant_conv.load_state_dict(pq_state_dict, strict=True)
+                print("Successfully loaded fine-tuned post_quant_conv", flush=True)
+        
+        model.eval()
         return model
+    
     
     def build_generator(self, generator_config):
         """
@@ -121,7 +158,8 @@ class Model(pl.LightningModule):
                 progress = (min(step, total_steps) - warmup_steps) / (total_steps - warmup_steps)
                 cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
                 decayed = (1 - min_lr_multiplier) * cosine_decay + min_lr_multiplier
-                return decayed      
+                return decayed 
+                # return 1.0     
         
         return LambdaLR(optimizer, lr_lambda)
     
@@ -134,11 +172,20 @@ class Model(pl.LightningModule):
     def get_input(self, batch, k):
         if type(batch) == dict:
             x = batch[k]
-            frame_rate = batch['frame_rate']
+            frame_rate = batch.get('frame_rate')
         else:
             x = batch
             frame_rate = None
-        assert len(x.shape) == 5, 'input must be 5D tensor'
+
+        # Image datasets return [B, C, H, W]; video datasets return [B, F, C, H, W].
+        if len(x.shape) == 4:
+            x = x.unsqueeze(1)
+
+        assert len(x.shape) == 5, 'input must be 4D or 5D tensor'
+
+        if frame_rate is None:
+            frame_rate = torch.full((x.shape[0],), 5, device=x.device, dtype=torch.float32)
+
         return x, frame_rate
     
     
@@ -156,17 +203,21 @@ class Model(pl.LightningModule):
         else:
             b, e, h, w = images.size()
             f = 1
-        x = self.ae.encode(images)['continuous']
+        x, _ = self.ae.encode(images)
+        x = x['continuous']
         x = x * (self.enc_scale)
         x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
         return x
     
     @torch.no_grad()
     def decode_frames(self, x):
+        print("Decoding the frames now")
         frame = x[:,0] 
         frame = frame / (self.enc_scale)
-
+        # print(self.ae.decoder)
         frame = self.ae.post_quant_conv(frame)
+        if self.give_pre_end == True:
+            return frame
         samples = (self.ae.decoder(frame)).unsqueeze(1)
         for idx in range(1, x.shape[1]):
             frame = x[:,idx] 
@@ -183,21 +234,15 @@ class Model(pl.LightningModule):
         x = self.encode_frames(images)
 
         b, f, e, h, w = x.size()
-        
-        if f == 1:
-            context = None
-            target = x.squeeze(1)
-        else:
-            context = x[:,:-1].clone()
-            target = x[:,-1]
+
+        context = x[:,:-1].clone() if f > 1 else None
+        target = x[:,-1:]  # [B, 1, e, h, w] — keep frame dim
 
         t = torch.rand((x.shape[0],), device=x.device)
         target_t, noise = self.add_noise(target, t)
-        
-        target_t = target_t.unsqueeze(1)
-        
+
         pred = self.vit(target_t, context, t, frame_rate=frame_rate)
-        
+
         # -dxt/dt
         target = self.A(t) * target + self.B(t) * noise
 
@@ -219,21 +264,15 @@ class Model(pl.LightningModule):
         x = self.encode_frames(images)
 
         b, f, e, h, w = x.size()
-        
-        if f == 1:
-            context = None
-            target = x.squeeze(1)
-        else:
-            context = x[:,:-1].clone()
-            target = x[:,-1]
+
+        context = x[:,:-1].clone() if f > 1 else None
+        target = x[:,-1:]  # [B, 1, e, h, w] — keep frame dim
 
         t = torch.rand((x.shape[0],), device=x.device)
         target_t, noise = self.add_noise(target, t)
-        
-        target_t = target_t.unsqueeze(1)
-        
+
         pred = self.vit(target_t, context, t, frame_rate=frame_rate)
-        
+
         # -dxt/dt
         target = self.A(t) * target + self.B(t) * noise
 
@@ -312,10 +351,10 @@ class Model(pl.LightningModule):
         frame_rate = frame_rate[:N] if frame_rate is not None else None
         b, f, e, h, w = images.size()
 
-        l_visual_recon = [images[:,f] for f in range(images.size(1))]
-        l_visual_recon_ema = [images[:,f] for f in range(images.size(1))]
-        
-        
+        l_visual_recon = [images[:,i] for i in range(images.size(1))]
+        l_visual_recon_ema = [images[:,i] for i in range(images.size(1))]
+
+
         images = images[:,:-1] if f > 1 else None
 
         # sample
@@ -332,7 +371,7 @@ class Model(pl.LightningModule):
         sampled = vutils.make_grid(sampled, nrow=N, padding=2, normalize=False,)
         
         # sample
-        samples_ema = self.sample(images, eta=0.0, NFE=30, sample_with_ema=True, num_samples=N)[1]
+        samples_ema = self.sample(images, eta=0.0, NFE=30, sample_with_ema=True, num_samples=N, frame_rate=frame_rate)[1]
         # Only keep N first generated frame
         samples_ema = samples_ema[:N, 0]
 
@@ -347,6 +386,443 @@ class Model(pl.LightningModule):
         log["sampled"] = sampled
         self.vit.train()
         return log
+    
+class ModelVAE(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    
+    @torch.no_grad()
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            images = rearrange(images, 'b f e h w -> (b f) e h w')
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        x = self.ae.encode(images)
+        x = x['continuous']
+        x = x * (self.enc_scale)
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        return x
+    
+class ModelSelfdist(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    
+    @torch.no_grad()
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            images = rearrange(images, 'b f e h w -> (b f) e h w')
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        x, _ = self.ae.context_encode(images)
+        x = x['continuous']
+        x = x * (self.enc_scale)
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        return x
+    
+class Modeltjepa(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    
+    @torch.no_grad()
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            images = rearrange(images, 'b f e h w -> (b f) e h w')
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        x = self.ae.context_encode(images)
+        x = x['continuous']
+        x = x * (self.enc_scale)
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        return x
+    
+class ModelTMAE(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            # print("Shape of image : ", images.shape)
+            # images = rearrange(images, 'b f e h w -> (b f) e h w')
+            img1 = images[:, 0] # [B, 3, 256, 256]
+            img2 = images[:, 1]
+            f = 1
+            # print("Image 1 : ", img1.shape)
+            # print("Image 2 : ", img2.shape)
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        
+        x = self.ae.encode(img1, img2)
+        x = x["continuous"]
+        
+        x = x * (self.enc_scale)
+
+        # print("Shape of enc output : ", x.shape)
+
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        
+        return x
+    
+    @torch.no_grad()
+    def log_images(self, batch, **kwargs):
+        log = dict()
+        images, frame_rate = self.get_input(batch, 'images')
+        N = min(5, images.size(0))
+        images = images[:N]
+        frame_rate = frame_rate[:N] if frame_rate is not None else None
+        b, f, e, h, w = images.size()
+
+        l_visual_recon = [images[:,i] for i in range(images.size(1))]
+        l_visual_recon_ema = [images[:,i] for i in range(images.size(1))]
+
+
+        images = images[:,:-1] if f > 2 else None
+
+        # sample
+        samples = self.sample(images, eta=0.0, NFE=30, sample_with_ema=False, num_samples=N, frame_rate=frame_rate)[1]
+        
+        # Only keep N first generated frame
+        samples = samples[:N, 0]
+
+        l_visual_recon.append(samples)
+
+        l_visual_recon = torch.cat(l_visual_recon, dim=0)
+        chunks = torch.chunk(l_visual_recon, 2 + 2, dim=0)
+        sampled = torch.cat(chunks, 0)
+        sampled = vutils.make_grid(sampled, nrow=N, padding=2, normalize=False,)
+        
+        # sample
+        samples_ema = self.sample(images, eta=0.0, NFE=30, sample_with_ema=True, num_samples=N, frame_rate=frame_rate)[1]
+        # Only keep N first generated frame
+        samples_ema = samples_ema[:N, 0]
+
+        l_visual_recon_ema.append(samples_ema)
+
+        l_visual_recon_ema = torch.cat(l_visual_recon_ema, dim=0)
+        chunks_ema = torch.chunk(l_visual_recon_ema, 2 + 2, dim=0)
+        sampled_ema = torch.cat(chunks_ema, 0)
+        sampled_ema = vutils.make_grid(sampled_ema, nrow=N, padding=2, normalize=False)
+
+        log["ema_sampled"] = sampled_ema
+        log["sampled"] = sampled
+        self.vit.train()
+        return log
+    
+class ModelCMAE(ModelTMAE):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+
+
+    @torch.no_grad()
+    def decode_frames(self, x):
+        frame = x[:,0] 
+        frame = frame / (self.enc_scale)
+
+        frame = self.ae.post_quant_conv(frame)
+        _, samples = (self.ae.decoder(frame))
+        samples = samples.unsqueeze(1)
+        for idx in range(1, x.shape[1]):
+            frame = x[:,idx] 
+            frame = frame / (self.enc_scale)
+            frame = self.ae.post_quant_conv(frame)
+            frame = self.ae.decoder(frame)
+            samples = torch.cat([samples, (frame).unsqueeze(1)], dim=1)
+        return samples
+    
+
+class ModelCDINO(ModelTMAE):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+
+    
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            img1 = images[:, 0] # [B, 3, 256, 256]
+            img2 = images[:, 1]
+            f = 1
+
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        
+        x, _ = self.ae.encode(img1, img2)
+        x = x["continuous"]
+        
+        x = x * (self.enc_scale)
+
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        
+        return x
+    
+    
+    @torch.no_grad()
+    def decode_frames(self, x):
+        frame = x[:,0] 
+        frame = frame / (self.enc_scale)
+
+        frame = self.ae.post_quant_conv(frame)
+        _, samples = (self.ae.decoder(frame))
+        samples = samples.unsqueeze(1)
+        for idx in range(1, x.shape[1]):
+            frame = x[:,idx] 
+            frame = frame / (self.enc_scale)
+            frame = self.ae.post_quant_conv(frame)
+            frame = self.ae.decoder(frame)
+            samples = torch.cat([samples, (frame).unsqueeze(1)], dim=1)
+        return samples
+
+
+class ModelFrames(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+
+    def get_input(self, batch, k):
+        if type(batch) == dict:
+            x = batch[k]
+            
+            frame_rate = batch['frame_rate']
+            
+        else:
+            x = batch
+            # print("Shape of x in else blocks : ", x.shape)
+            frame_rate = None
+        # assert len(x.shape) == 5, 'input must be 5D tensor'
+        return x, frame_rate
+    
+    @torch.no_grad()
+    def log_images(self, batch, **kwargs):
+        log = dict()
+        images, frame_rate = self.get_input(batch, 'image')
+        N = min(5, images.size(0))
+        images = images[:N]
+        frame_rate = frame_rate[:N] if frame_rate is not None else None
+        # print("Shape of images in log images : ", images.shape)
+        
+        b, f, e, h, w = images.size()
+
+        l_visual_recon = [images[:,f] for f in range(images.size(1))]
+        l_visual_recon_ema = [images[:,f] for f in range(images.size(1))]
+
+        # l_visual_recon = [images]
+        # l_visual_recon_ema = [images]
+        
+        
+        images = images[:,:-1] if f > 1 else None
+
+        # sample
+        samples = self.sample(images, eta=0.0, NFE=30, sample_with_ema=False, num_samples=N, frame_rate=frame_rate)[1]
+        
+        # Only keep N first generated frame
+        samples = samples[:N, 0]
+
+        # print(f"DEBUG: Sampled frames shape: {samples.shape}")
+
+        l_visual_recon.append(samples)
+
+
+        l_visual_recon = torch.cat(l_visual_recon, dim=0)
+
+        # print(f"DEBUG: Concatenated tensor shape: {l_visual_recon.shape}")
+
+        # chunks = torch.chunk(l_visual_recon, 2 + 2, dim=0)
+        # sampled = torch.cat(chunks, 0)
+        # sampled = vutils.make_grid(sampled, nrow=N, padding=2, normalize=False,)
+        sampled = vutils.make_grid(l_visual_recon, nrow=N, padding=2, normalize=False,)
+        
+        # sample
+        samples_ema = self.sample(images, eta=0.0, NFE=30, sample_with_ema=True, num_samples=N)[1]
+        # Only keep N first generated frame
+        samples_ema = samples_ema[:, 0]
+
+        l_visual_recon_ema.append(samples_ema)
+
+        l_visual_recon_ema = torch.cat(l_visual_recon_ema, dim=0)
+        # chunks_ema = torch.chunk(l_visual_recon_ema, 2 + 2, dim=0)
+        # sampled_ema = torch.cat(chunks_ema, 0)
+        # sampled_ema = vutils.make_grid(sampled_ema, nrow=N, padding=2, normalize=False)
+        sampled_ema = vutils.make_grid(l_visual_recon_ema, nrow=N, padding=2, normalize=False)
+
+        log["ema_sampled"] = sampled_ema
+        log["sampled"] = sampled
+        self.vit.train()
+        return log
+
+class ModelVAE_lr(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    
+    @torch.no_grad()
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            images = rearrange(images, 'b f e h w -> (b f) e h w')
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        x = self.ae.encode(images)
+        x = x['continuous']
+        x = x * (self.enc_scale)
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        return x
+    
+    def get_warmup_scheduler(self, optimizer, warmup_steps=1, min_lr_multiplier=1.0):
+        total_steps = self.trainer.max_epochs * self.num_iters_per_epoch
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Linear warmup
+                return step/warmup_steps
+            else:
+                # progress = (min(step, total_steps) - warmup_steps) / (total_steps - warmup_steps)
+                # cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                # decayed = (1 - min_lr_multiplier) * cosine_decay + min_lr_multiplier
+                # return decayed 
+                return 1.0     
+        
+        return LambdaLR(optimizer, lr_lambda)
+    
+
+    
+class Model_16_dist(Model):
+    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, sigma_min=1e-5, timescale=1.0, enc_scale=4, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1):
+        super().__init__(
+            tokenizer_config=tokenizer_config,
+            generator_config=generator_config,
+            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
+            sigma_min=sigma_min,
+            timescale=timescale,
+            enc_scale=enc_scale,
+            warmup_steps=warmup_steps,
+            min_lr_multiplier=min_lr_multiplier,
+            num_pred_frames=num_pred_frames,
+        )
+        
+    def encode_frames(self, images):
+        if len(images.size()) == 5:
+            b, f, e, h, w = images.size()
+            images = rearrange(images, 'b f e h w -> (b f) e h w')
+        else:
+            b, e, h, w = images.size()
+            f = 1
+        
+        x, _ = self.ae.encode(images)
+        x = x["continuous"]
+        x = self.ae.quant_conv(x)
+        # print("Shape of input x : ", x.shape)
+        # print("Before : ", x.mean(), x.std())
+        # x = self.ae.encoder(images)
+        # print("Shape of encoded latents: ", x.shape)
+        x = x * (self.enc_scale)
+        # print("After : ", x.mean(), x.std())
+        x = rearrange(x, '(b f) e h w -> b f e h w',b=b, f=f)
+        return x
+    
+    @torch.no_grad()
+    def decode_frames(self, x):
+        frame = x[:,0] 
+        frame = frame / (self.enc_scale)
+
+        frame = self.ae.post_quant_conv(frame)
+        samples = (self.ae.decoder(frame)).unsqueeze(1)
+        for idx in range(1, x.shape[1]):
+            frame = x[:,idx] 
+            frame = frame / (self.enc_scale)
+            frame = self.ae.post_quant_conv(frame)
+            frame = self.ae.decoder(frame)
+            samples = torch.cat([samples, (frame).unsqueeze(1)], dim=1)
+        # print("Shape of samples : ", samples.shape)
+        return samples
     
 
 class ModelIF(Model):

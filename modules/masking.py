@@ -95,7 +95,7 @@ def mask_tokens_discard(x, mask_ratio):
 
 def tube_mask_two_frames(x1, x2, mask_ratio_frame1, mask_ratio_frame2, mask_token):
     """
-    Tube/block masking for 2-frame MAE setup.
+    Tube masking for 2-frame MAE setup.
     
     Args:
         x1: [B, N, D] - frame 1 token embeddings
@@ -129,7 +129,7 @@ def tube_mask_two_frames(x1, x2, mask_ratio_frame1, mask_ratio_frame2, mask_toke
     # -------------------------------
     # Step 2: Frame 2 masking (tube + include frame1 masks)
     # -------------------------------
-    # Start by marking all frame1 masked tokens as masked in frame2
+  
     mask_frame2 = mask_frame1.clone()
 
     # Add additional random masks for frame2
@@ -143,8 +143,6 @@ def tube_mask_two_frames(x1, x2, mask_ratio_frame1, mask_ratio_frame2, mask_toke
             for idx in avail[:num_additional_mask2]:
                 mask_frame2[b, idx] = 1
 
-    # masks replaced by learnable tokens
-    # x2: [B, N, D], mask_frame2: [B, N] bool, mask_token: [1, 1, D]
     mask_token_expanded = mask_token.expand(x2.size(0), x2.size(1), x2.size(2))
     x2_masked = x2 * (~mask_frame2.unsqueeze(-1)) + mask_token_expanded * mask_frame2.unsqueeze(-1)
 

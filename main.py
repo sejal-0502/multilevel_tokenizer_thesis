@@ -17,6 +17,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.profilers import PyTorchProfiler
 from pytorch_lightning.strategies import DDPStrategy
 from callbacks import CodebookTSNELogger, CodebookUsageLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from util import *
 
@@ -59,6 +60,15 @@ def get_callbacks(opt, logdir, ckptdir, config, lightning_config, now):
     for cb in callbacks_config:
         # resolve interpolations in the config
         callbacks.append(instantiate_from_config(OmegaConf.merge(overrides, cb)))
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=ckptdir,
+        filename='checkpoint-{step:06d}', # Saves as checkpoint-000500.ckpt
+        every_n_train_steps=500,           # The magic number
+        save_top_k=-1,                     # Set to -1 to keep all, or 3 to keep latest 3
+        save_last=True                     # Always updates a last.ckpt
+    )
+    callbacks.append(checkpoint_callback)
 
     return callbacks
 
@@ -125,13 +135,13 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--val_check_interval",
         type=float,
-        default=0.50,
+        default=1.0,
         help="Validation interval inside epoch (float=fraction of epoch, int=steps)"
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=15,
+        default=25,
         help="number of epochs",
     )
     parser.add_argument("-p", "--project", help="name of new or path to existing project")
@@ -149,6 +159,12 @@ def get_parser(**parser_kwargs):
         type=str2bool,
         nargs="?",
         default=True,
+    )
+    parser.add_argument(
+        "--dual_quantizer",
+        type=str2bool,
+        nargs="?",
+        default=False,
     )
     parser.add_argument(
         "--tsne_epoch_frequency", 
@@ -190,13 +206,13 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--log_img_frequency",
         type=int,
-        default=2000,
+        default=500,
         help="log image frequency",
     )
     parser.add_argument(
         "--log_ckpt_frequency",
         type=int,
-        default=2000,
+        default=500,
         help="checkpointing frequency",
     )
     return parser
@@ -326,8 +342,16 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = get_callbacks(opt, logdir, ckptdir, config, lightning_config, now)
     if opt.tsne_epoch_frequency is not None and opt.tsne_epoch_frequency > 0:
-        trainer_kwargs["callbacks"].append(CodebookTSNELogger(epoch_frequency=opt.tsne_epoch_frequency))
-        trainer_kwargs["callbacks"].append(CodebookUsageLogger(log_batches_training=opt.indices_used_frequency))
+        if opt.dual_quantizer:
+            trainer_kwargs["callbacks"].append(CodebookTSNELogger(epoch_frequency=opt.tsne_epoch_frequency, quantizer_attr="quantize"))
+            trainer_kwargs["callbacks"].append(CodebookUsageLogger(log_batches_training=opt.indices_used_frequency, quantizer_attr="quantize"))
+
+            trainer_kwargs["callbacks"].append(CodebookTSNELogger(epoch_frequency=opt.tsne_epoch_frequency, quantizer_attr="quantize2"))
+            trainer_kwargs["callbacks"].append(CodebookUsageLogger(log_batches_training=opt.indices_used_frequency, quantizer_attr="quantize2"))
+
+        else:
+            trainer_kwargs["callbacks"].append(CodebookTSNELogger(epoch_frequency=opt.tsne_epoch_frequency, quantizer_attr="quantize"))
+            trainer_kwargs["callbacks"].append(CodebookUsageLogger(log_batches_training=opt.indices_used_frequency, quantizer_attr="quantize"))
         
     trainer = Trainer(**trainer_kwargs)
     
@@ -375,7 +399,17 @@ if __name__ == "__main__":
     # run
     try:
         if opt.resume:
-            trainer.fit(model, data, ckpt_path = opt.resume_from_checkpoint)
+            ckpt = torch.load(opt.resume_from_checkpoint, map_location="cpu")
+            missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+            print("Missing keys:", missing)
+            print("Unexpected keys:", unexpected)
+
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    print("TRAINABLE:", name)
+
+            trainer.fit(model, data)
+            # trainer.fit(model, data, ckpt_path = opt.resume_from_checkpoint)
         else:
             trainer.fit(model, data)
     except Exception:

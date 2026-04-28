@@ -23,8 +23,10 @@ class CustomBase(Dataset):
 class CustomTrain(CustomBase):
     def __init__(self, size, training_images_list_file, random_crop=False, scale=False, crop_size=None):
         super().__init__()
+
         with open(training_images_list_file, "r") as f:
             paths = f.read().splitlines()
+        
         self.data = ImagePaths(paths=paths, size=size, crop_size=crop_size,
                                random_crop=random_crop, scale=scale)
 

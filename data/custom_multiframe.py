@@ -21,7 +21,7 @@ class RandomResizedCenterCrop(object):
     def __init__(self, size, scale=(0.5, 1.0), interpolation=Image.BILINEAR):
         self.scale = scale
         self.interpolation = interpolation
-        self.size = size
+        self.size = size[0]
         self.fixed_params = None
 
     def get_params(self, img):
@@ -470,3 +470,4 @@ def instantiate_from_config(config):
     if not "target" in config:
         raise KeyError("Expected key `target` to instantiate.")
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
+

@@ -8,23 +8,18 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
 from util import instantiate_from_config
+      
 
-class Jepa(pl.LightningModule):
-    """
-    Predictive SSL Model
+###############################################################################
+# Model : EMA-Supervision in the decoder feature space
+###############################################################################      
 
-    context_encoder : masked i/p img
-    target encoder : fully visible i/p img
-    predictor : i/p context encoder representation at mask positions, pos embeds for those mask positions
-    loss : l1 loss (predicted_masks, traget tokens at mask indices)
-
-    """
-    
+class Jepa_dualbranch_decoderbased(pl.LightningModule):
     def __init__(
         self,
         ema_momentum,
-        context_encoder_config,
-        target_encoder_config,
+        mask_ratio,
+        encoder_config,
         quantizer_config,
         decoder_config,
         loss_config,
@@ -48,6 +43,7 @@ class Jepa(pl.LightningModule):
         self.only_decoder=only_decoder
         self.min_lr_multiplier = min_lr_multiplier
         self.ema_momentum = ema_momentum
+        self.mask_ratio = mask_ratio
         
         self.gan_loss = None
         
@@ -55,111 +51,79 @@ class Jepa(pl.LightningModule):
         self.scale_equivariance = scale_equivariance
 
         # Instantiate core components
-        self.context_encoder = instantiate_from_config(context_encoder_config)
-        self.target_encoder = instantiate_from_config(target_encoder_config)
+        self.context_encoder = instantiate_from_config(encoder_config)
+        self.target_encoder = instantiate_from_config(encoder_config)
         self.quantize = instantiate_from_config(quantizer_config)
         self.decoder = instantiate_from_config(decoder_config)
         self.loss = instantiate_from_config(loss_config)
         self.entropy_loss_weight_scheduler = instantiate_from_config(entropy_loss_weight_scheduler_config)
 
-        # projection for feature comparison : [768 -> 384]
-        self.quant_conv = nn.Conv2d(context_encoder_config.params["z_channels"], quantizer_config.params["e_dim"], 1)
-        self.post_quant_conv = nn.Conv2d(quantizer_config.params["e_dim"], context_encoder_config.params["z_channels"], 1)
+        # Convolutional layers for quantization
+        self.quant_conv = nn.Conv2d(encoder_config.params["z_channels"], quantizer_config.params["e_dim"], 1)
+        self.post_quant_conv = nn.Conv2d(quantizer_config.params["e_dim"], decoder_config.params["z_channels"], 1)
 
-        self.encoder_normalize_embedding = context_encoder_config.params.get("normalize_embedding", False)
+        self.encoder_normalize_embedding = encoder_config.params.get("normalize_embedding", False)
         self.quantizer_normalize_embedding = quantizer_config.params.get("normalize_embedding", False)
 
         # Image and patch size
-        self.image_size = context_encoder_config.params["resolution"]
-        self.patch_size = context_encoder_config.params["patch_size"]
+        self.image_size = encoder_config.params["resolution"]
+        self.patch_size = encoder_config.params["patch_size"]
 
         self.target_encoder.load_state_dict(self.context_encoder.state_dict())
 
         for p in self.target_encoder.parameters():
             p.requires_grad = False
-    
+
     def get_input(self, batch):
         for k, v in batch.items():
             x = batch["images"]
             b, f, c, h, w = x.shape # [B, 1, 3, 256, 256]
             x = x.reshape(b, f*c, h, w)
         return x.float()
-
+    
     def entropy_loss_weight_scheduling(self):
         self.loss.entropy_loss_weight = self.entropy_loss_weight_scheduler(self.global_step)
-
-    def context_encode(self, x):
-        h = self.context_encoder(x)
-        h = self.quant_conv(h)
         
+    def context_encode(self, x):
+        h = self.context_encoder(x, self.mask_ratio, mode="student")
+        h = self.quant_conv(h)
         if self.encoder_normalize_embedding:
             h = F.normalize(h, p=2, dim=1)
 
-        ret = self.quantize(h)
-
-        h = self.post_quant_conv(ret["quantized"])
-        return ret, h
+        ret_spatial = self.quantize(h)
+        ret_spatial["continuous"] = h
+        
+        return ret_spatial
     
     def target_encode(self, x):
-        h = self.target_encoder(x)
+        h = self.target_encoder(x, self.mask_ratio, mode="teacher")
+        B, D, H, W = h.shape
+        h = h.reshape(B, D, H*W).permute(0, 2, 1)
+        h = F.normalize(h, p=2, dim=-1)
         return h
     
     def decode(self, quant):
-        # distill_conv_out = self.post_quant_conv_distill(quant)
-        rec = self.decoder(quant)
-        return rec
-        
+        quant2 = self.post_quant_conv(quant)
+        self.decoder.give_pre_end = True
+        rec, rec_target = self.decoder(quant2)
+        self.decoder.give_pre_end = False
+        rec_target = F.normalize(rec_target, p=2, dim=-1)
+        return rec, rec_target
+
     def forward(self, input):
-        cb_losses, context = self.context_encode(input)
+        encoded_spatial = self.context_encode(input)
         with torch.no_grad():
             target = self.target_encode(input)
-        rec = self.decode(context.detach())
-        return rec, (cb_losses['quantization_loss'], cb_losses['entropy_loss']), context, target
-
-
-    def l1_loss(self, context_feats, target_feats):
-
-        target_feats = target_feats.detach()
-        B, D, H, W = context_feats.shape
-
-        context_feats = context_feats.reshape(B, D, H*W).permute(0, 2, 1)
-        target_feats = target_feats.reshape(B, D, H*W).permute(0, 2, 1)
-
-        context_feats = F.normalize(context_feats, p=2, dim=-1)
-        target_feats = F.normalize(target_feats, p=2, dim=-1)
-
-        cos_sim = F.cosine_similarity(context_feats, target_feats, dim=-1)
-        
-        return (1 - cos_sim).mean()
-        # return F.l1_loss(context_feats, target_feats)
-
+        rec_recon, rec_target = self.decode(encoded_spatial["quantized"])
+        return rec_recon, rec_target, (encoded_spatial['quantization_loss'], encoded_spatial['entropy_loss']), target
+    
     @torch.no_grad()
     def update_target_encoder(self):
-        context_params = dict(self.context_encoder.named_parameters())
-        skipped_layers = 0
-        updated_layers = 0
-        prefix_to_strip = 'context_encoder.'
+        m = self.ema_momentum
 
-        for target_name, p_t in self.target_encoder.named_parameters():
-            if target_name.startswith(prefix_to_strip):
-                context_name = target_name[len(prefix_to_strip):]
-            else:
-                context_name = target_name
-
-            if context_name in context_params:
-                p_s = context_params[context_name]
-                if p_s.shape == p_t.shape:
-                    p_t.data = self.ema_momentum * p_t.data + (1 - self.ema_momentum) * p_s.data
-                    updated_layers += 1
-                else:
-                    print(f"EMA Skipped: Shape mismatch for key '{context_name}' ({p_s.shape} vs {p_t.shape})")
-                    skipped_layers += 1
-            else:
-                print(f"EMA Skipped: Parameter '{context_name}' not found in student encoder.")
-                skipped_layers += 1
-
-        print(f">> Updated {updated_layers} parameter tensors.")
-        print(f"!! Skipped {skipped_layers} parameter tensors (due to missing key or shape mismatch).")
+        for p_s, p_t in zip(self.context_encoder.parameters(),
+                            self.target_encoder.parameters()):
+            p_t.data.mul_(m).add_((1 - m) * p_s.data)
 
     def get_warmup_scheduler(self, optimizer, warmup_steps, min_lr_multiplier):
         min_lr = self.learning_rate * min_lr_multiplier
@@ -177,7 +141,7 @@ class Jepa(pl.LightningModule):
                 return 1.0
               
         return LambdaLR(optimizer, lr_lambda)
-
+    
     def configure_optimizers(self):
         lr = self.learning_rate
         opt_ae = torch.optim.Adam(list(self.context_encoder.parameters())+
@@ -193,10 +157,10 @@ class Jepa(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch)
-        xrec, qloss, context, target  = self(x)
+        xrec, dec_target, qloss, target  = self(x)
 
         distill_loss = None
-        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, 0, self.global_step,
+        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, target, dec_target, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="val")
         self.log("val/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
@@ -204,8 +168,8 @@ class Jepa(pl.LightningModule):
         self.log("val/rec_loss", rec_loss,
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
-        l1_loss = self.l1_loss(context, target)
-        self.log("val/l1_loss", l1_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        jepa_loss = log_dict_ae["val/jepa_loss"]
+        self.log("val/jepa_loss", jepa_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
         self.entropy_loss_weight_scheduling()
@@ -217,20 +181,17 @@ class Jepa(pl.LightningModule):
         
         x = self.get_input(batch)
         
-        xrec, qloss, context, target  = self(x)
+        xrec, dec_target, qloss, target  = self(x)
 
         distill_loss = None
 
         optimizer_idx = 0
-        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, optimizer_idx, self.global_step,
+        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, target, dec_target, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="train")
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
-        l1_loss = self.l1_loss(context, target)
-        self.log("train/l1_loss", l1_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         
-        aeloss = aeloss + l1_loss
         aeloss = aeloss / self.grad_acc_steps
         self.manual_backward(aeloss) 
         if (batch_idx+1) % self.grad_acc_steps == 0:
@@ -253,13 +214,13 @@ class Jepa(pl.LightningModule):
         log["inputs"] = x
         log["reconstructions"] = xrec
         return log
-
-class Jepa_1d(Jepa):    
+    
+class Jepa_bootleg(Jepa_dualbranch_decoderbased):
     def __init__(
         self,
         ema_momentum,
-        context_encoder_config,
-        target_encoder_config,
+        mask_ratio,
+        encoder_config,
         quantizer_config,
         decoder_config,
         loss_config,
@@ -272,74 +233,74 @@ class Jepa_1d(Jepa):
         only_decoder=False,
         scale_equivariance=None,
     ):
-        super().__init__(ema_momentum, context_encoder_config, target_encoder_config, quantizer_config, decoder_config, 
-                         loss_config, grad_acc_steps, cont_ratio_trainig, ignore_keys, monitor, entropy_loss_weight_scheduler_config,
-                         min_lr_multiplier, only_decoder, scale_equivariance)
-
-
-        # Instantiate core components
-        self.context_encoder = instantiate_from_config(context_encoder_config)
-        self.target_encoder = instantiate_from_config(target_encoder_config)
-        self.quantize = instantiate_from_config(quantizer_config)
-        self.decoder = instantiate_from_config(decoder_config)
-        self.loss = instantiate_from_config(loss_config)
-        self.entropy_loss_weight_scheduler = instantiate_from_config(entropy_loss_weight_scheduler_config)
-
-        # Convolutional layers for quantization
-        self.quant_conv = nn.Linear(context_encoder_config.params["z_channels"], quantizer_config.params["e_dim"])
-        self.post_quant_conv = nn.Linear(quantizer_config.params["e_dim"], context_encoder_config.params["z_channels"])
+        super().__init__(ema_momentum,mask_ratio,encoder_config,quantizer_config,decoder_config,loss_config,grad_acc_steps,
+                         cont_ratio_trainig,ignore_keys,monitor,entropy_loss_weight_scheduler_config,min_lr_multiplier,
+                         only_decoder,scale_equivariance)
+        
     
+        in_dim = 768
+        hidden_dim = 64
+        out_dim = 768
+        self.net = nn.Sequential(nn.Linear(in_dim, hidden_dim, bias=False),
+                                 nn.LayerNorm(hidden_dim),
+                                 nn.ReLU(inplace=True),
+                                 nn.Linear(hidden_dim, out_dim))
+
+
     def context_encode(self, x):
-        h = self.context_encoder(x)
+        h = self.context_encoder(x, self.mask_ratio, mode="student")
+        ret_target = h
         h = self.quant_conv(h)
-        h = h.permute(0, 2, 1)
         if self.encoder_normalize_embedding:
             h = F.normalize(h, p=2, dim=1)
-        h = h.unsqueeze(2)                  # [B, C, 1, N]
-        ret = self.quantize(h)
-        ret["quantized"] = ret["quantized"].squeeze(2).permute(0, 2, 1)
-        ret["quantized"] = self.post_quant_conv(ret["quantized"])
-        return ret
+
+        ret_spatial = self.quantize(h)
+        
+        return ret_spatial, ret_target
     
     def target_encode(self, x):
-        h = self.target_encoder(x) # [B, C, H, W]
+        h = self.target_encoder(x, self.mask_ratio, mode="teacher")
         B, D, H, W = h.shape
         h = h.reshape(B, D, H*W).permute(0, 2, 1)
+        h = F.normalize(h, p=2, dim=-1)
         return h
+
+    def predictor(self, x):
+        B, C, H, W = x.shape
+        x = x.reshape(B, C, H*W).permute(0, 2, 1)
+        x = self.net(x)
+        x = F.normalize(x, p=2, dim=-1)
+        return x
     
     def decode(self, quant):
         # distill_conv_out = self.post_quant_conv_distill(quant)
-        rec = self.decoder(quant)
+        quant2 = self.post_quant_conv(quant)
+        rec = self.decoder(quant2)
         return rec
-        
+
     def forward(self, input):
-        context = self.context_encode(input)
-        quant_tokens = context["quantized"]
+        encoded_spatial, encoded_target = self.context_encode(input)
+        encoded_target = self.predictor(encoded_target)
         with torch.no_grad():
             target = self.target_encode(input)
-        rec = self.decode(quant_tokens.detach())
-        return rec, (context['quantization_loss'], context['entropy_loss']), quant_tokens, target
-
+        rec_recon = self.decode(encoded_spatial["quantized"])
+        return rec_recon, encoded_target, (encoded_spatial['quantization_loss'], encoded_spatial['entropy_loss']), target
     
-    def l1_loss(self, context_feats, target_feats):
+    @torch.no_grad()
+    def update_target_encoder(self):
+        m = self.ema_momentum
 
-        target_feats = target_feats.detach()
-
-        context_feats = F.normalize(context_feats, p=2, dim=-1)
-        target_feats = F.normalize(target_feats, p=2, dim=-1)
-
-        cos_sim = F.cosine_similarity(context_feats, target_feats, dim=-1)
-        
-        return (1 - cos_sim).mean()
-        # return F.l1_loss(context_feats, target_feats)
+        for p_s, p_t in zip(self.context_encoder.parameters(),
+                            self.target_encoder.parameters()):
+            p_t.data.mul_(m).add_((1 - m) * p_s.data)
 
     
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch)
-        xrec, qloss, context, target  = self(x)
+        xrec, encoded_target, qloss, target  = self(x)
 
         distill_loss = None
-        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, 0, self.global_step,
+        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, target, encoded_target, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="val")
         self.log("val/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
@@ -347,9 +308,8 @@ class Jepa_1d(Jepa):
         self.log("val/rec_loss", rec_loss,
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
-        l1_loss = self.l1_loss(context, target)
-        self.log("val/l1_loss", l1_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        
+        jepa_loss = log_dict_ae["val/jepa_loss"]
+        self.log("val/jepa_loss", jepa_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
         self.entropy_loss_weight_scheduling()
@@ -361,20 +321,17 @@ class Jepa_1d(Jepa):
         
         x = self.get_input(batch)
         
-        xrec, qloss, context, target  = self(x)
+        xrec, encoded_target, qloss, target  = self(x)
 
         distill_loss = None
 
         optimizer_idx = 0
-        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, optimizer_idx, self.global_step,
+        aeloss, log_dict_ae = self.loss(qloss, distill_loss, x, xrec, target, encoded_target, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="train")
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
-        l1_loss = self.l1_loss(context, target)
-        self.log("train/l1_loss", l1_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         
-        aeloss = aeloss + l1_loss
         aeloss = aeloss / self.grad_acc_steps
         self.manual_backward(aeloss) 
         if (batch_idx+1) % self.grad_acc_steps == 0:
@@ -382,49 +339,3 @@ class Jepa_1d(Jepa):
             opt_ae.zero_grad()
             scheduler_ae_warmup.step()
             self.update_target_encoder()
-
-    def get_last_layer(self):
-        try:
-            return self.decoder.conv_out.weight
-        except:
-            return None
-        
-    def log_images(self, batch, **kwargs):
-        log = dict()
-        x = self.get_input(batch)
-        x = x.to(self.device)
-        xrec, _, _, _ = self(x)
-        log["inputs"] = x
-        log["reconstructions"] = xrec
-        return log
-
-class Jepa_weak(Jepa):
-    def __init__(
-        self,
-        ema_momentum,
-        context_encoder_config,
-        target_encoder_config,
-        quantizer_config,
-        decoder_config,
-        loss_config,
-        grad_acc_steps=1,
-        cont_ratio_trainig= 0.0,
-        ignore_keys=None,
-        monitor=None,
-        entropy_loss_weight_scheduler_config=None,
-        min_lr_multiplier=0.1,
-        only_decoder=False,
-        scale_equivariance=None,
-    ):
-        super().__init__(ema_momentum, context_encoder_config, target_encoder_config, quantizer_config, decoder_config, 
-                         loss_config, grad_acc_steps, cont_ratio_trainig, ignore_keys, monitor, entropy_loss_weight_scheduler_config,
-                         min_lr_multiplier, only_decoder, scale_equivariance)
-        
-    def forward(self, input):
-        alpha = 0.02
-        cb_losses, context = self.context_encode(input)
-        with torch.no_grad():
-            target = self.target_encode(input)
-        context_enc = context * alpha + context.detach() * (1 - alpha) 
-        rec = self.decode(context_enc)
-        return rec, (cb_losses['quantization_loss'], cb_losses['entropy_loss']), context, target
