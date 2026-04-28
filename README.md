@@ -4,8 +4,8 @@ This repository hosts the code for a tokenizers that preserve both the semantic 
 
 <table>
   <tr>
-    <td align="center"><img src="imgs/model_perf.png" width="200"/></td>
-    <td align="center"><img src="imgs/visuals.png" width="400"/></td>
+    <td align="center"><img src="imgs/model_perf.png" width="300"/></td>
+    <td align="center"><img src="imgs/visuals.png" width="600"/></td>
   </tr>
   <tr>
     <td align="center">Figure 1 : Performance of tokenizer across all 4 axes</td>
@@ -57,7 +57,7 @@ We have select the effective batch size of 128 for all our experiments.
 python main.py --base configs/generation.yaml -t True --n_gpus=4
 ```
 
-We do not make any changes in the generation code. Its sole purpose is evaluation and has been maintained as is. Original repository reference : [Orbis] (https://github.com/lmb-freiburg/orbis.git)
+We do not make any changes in the generation code. Its sole purpose is evaluation and has been maintained as is. Original repository reference : [Orbis](https://github.com/lmb-freiburg/orbis.git)
 
 ### Evaluations
 
