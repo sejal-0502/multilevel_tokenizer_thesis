@@ -19,21 +19,21 @@ We implement various Self-supervised learning methods for designing a tokenizer 
 
 Overall, from our experiments, self-supervised methods like Masking, Temporal context-based masking, Distillation from a strong pretrained priors, and EMA-stabilized teacher supervision can help maintain the balance between the semantic and perceptual objectives of a tokenizer. Dino distillation using auxiliary supervision like ours can maintain overall balance and improve the image generation quality.
 
-## Checkpoints
+## Checkpoints & Results
 
-Results for Multilevel Representation Learning. Checkpoints for the same in 'checkpoints' folder.
+Results for Multilevel Representation Learning. Checkpoints are located in the `checkpoints/` folder.
 
-| Model                 |   rFID ↓  |   gFID ↓  |    mIoU   |   RMSE    |
-|-----------------------|------------------------------------------------
-| VQ-VAE (Baseline)     |   29.09   |   45.09   |   34.32   |   6.4156  | 
-| MAE                   |   32.43   |   50.88   |   36.47   |   6.0660  |
-| Temporal MAE          |   31.86   |   55.10   |   35.46   |   6.1020  |  
-| Dino distill.         |   29.60   |   44.03   |   44.34   |   5.9185  |
-| Depth distill.        |   30.70   |   48.59   |   38.39   |   6.1160  |
-| Raft distill.         |   30.87   |   46.66   |   36.10   |   6.0661  |
-| EMA Supervision       |   33.52   |   49.29   |   35.25   |   6.1494  |
+| Model | rFID ↓ | gFID ↓ | mIoU ↑ | RMSE ↓ |
+| :--- | :---: | :---: | :---: | :---: |
+| VQ-VAE (Baseline) | 29.09 | 45.09 | 34.32 | 6.4156 | 
+| MAE | 32.43 | 50.88 | 36.47 | 6.0660 |
+| Temporal MAE | 31.86 | 55.10 | 35.46 | 6.1020 |  
+| **Dino Distill.** | **29.60** | **44.03** | **44.34** | **5.9185** |
+| Depth Distill. | 30.70 | 48.59 | 38.39 | 6.1160 |
+| Raft Distill. | 30.87 | 46.66 | 36.10 | 6.0661 |
+| EMA Supervision | 33.52 | 49.29 | 35.25 | 6.1494 |
 
-<i>Note: We add the scores for our best configurations here, however we have tried multiple mask ratios and architectural designs. Detailed results and dicussion can be found in a report attached.</i>
+> *Note: We report scores for our best configurations. Detailed discussion on mask ratios and architectural designs can be found in the attached report.*
 
 ## Requirements
 A suitable python environment can be created and activated with:
@@ -48,7 +48,8 @@ conda activate venv
 python main.py --base configs/tokenizer.yaml -t True --n_gpus=4 --enable_codebook_usage_logger 
 ```
 n_gpus: specifies number of gpus, default=1 \
-n_nodes: specifies number of nodes, default=1
+n_nodes: specifies number of nodes, default=1 \
+
 We have select the effective batch size of 128 for all our experiments.
 
 ### Fine-tune from previous checkpoint
