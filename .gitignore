@@ -1,25 +1,8 @@
-# Ignore all log files
-*.log
-logs_tk/tokenizer_288x512
-logs_wm/orbis_288x512
-
 # Ignore temporary folders
 /tmp/
 /build/
 /dist/
 
-# Ignore all txt files
-*.txt
-
-# Ignore all job files
-*.sbatch
-
-# Ignore multiple .yaml version
-configs/*.yaml
-
 # Ignore py_cache
 module/__pycache__
 __pycache__
-
-# Ignore .pyc 
-*.pyc
