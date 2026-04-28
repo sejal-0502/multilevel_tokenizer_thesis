@@ -19,6 +19,7 @@ configs/*.yaml
 
 # Ignore py_cache
 module/__pycache__
+__pycache__
 
 # Ignore .pyc 
 *.pyc
