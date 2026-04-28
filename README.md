@@ -52,12 +52,16 @@ n_nodes: specifies number of nodes, default=1 \
 
 We have select the effective batch size of 128 for all our experiments.
 
-### Fine-tune from previous checkpoint
+### Training a generation model
 ```
-python main.py --base configs/generation.yaml -t True --n_gpus=4 --enable_codebook_usage_logger 
+python main.py --base configs/generation.yaml -t True --n_gpus=4
 ```
 
+We do not make any changes in the generation code. Its sole purpose is evaluation and has been maintained as is. Original repository reference : [Orbis] (https://github.com/lmb-freiburg/orbis.git)
+
 ### Evaluations
+
+> *Follow the configs from the checkpoints attached.*
 
 rFID :
 ```
@@ -78,4 +82,4 @@ Depth RMSE :
 ```
 # python evaluate/depth.py --ckpt /work/dlclarge2/mutakeks-titok/Thesis/mae_orbis/baseline/checkpoints/last.ckpt --config /work/dlclarge2/mutakeks-titok/Thesis/mae_orbis/baseline/config.yaml --split_dir evaluate/data --dump_vis True 
 ```
-Note: For 2 frame setups (like Temporal MAE), '--num_input_frames' needs to be set manually to 2 for probe scripts. The code defauls to 1 input frame only.
+> *Note: For 2 frame setups (like Temporal MAE), '--num_input_frames' needs to be set manually to 2 for probe scripts. The code defauls to 1 input frame only.*
