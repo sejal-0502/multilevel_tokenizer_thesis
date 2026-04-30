@@ -19,6 +19,10 @@ class DummyLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
+######################################################################################
+# Loss : Baseline, MAE, Temporal MAE
+######################################################################################
+
 class VQLPIPSWithDiscriminator(nn.Module):
     def __init__(
         self,
@@ -184,7 +188,11 @@ class VQLPIPSWithDiscriminator(nn.Module):
                     f"{split}/logits_fake": logits_fake.detach().mean(),
                 }
                 return d_loss, log
-            
+
+######################################################################################
+# Models : EMA Supervision
+######################################################################################
+
 class VQLPIPSWithDiscriminator_decoderbased(VQLPIPSWithDiscriminator):
     def __init__(
         self,
@@ -391,6 +399,10 @@ class VQLPIPSWithDiscriminator_mae(VQLPIPSWithDiscriminator):
                 log[f"{split}/entropy_loss_weight"] = torch.tensor(self.entropy_loss_weight)
 
             return loss, log
+        
+######################################################################################
+# Models : Auxiliary Supervision using RAFT
+######################################################################################
 
 class VQLPIPSWithDiscriminator_motion(VQLPIPSWithDiscriminator):
     def __init__(
@@ -488,6 +500,10 @@ class VQLPIPSWithDiscriminator_motion(VQLPIPSWithDiscriminator):
                 log[f"{split}/entropy_loss_weight_q2"] = torch.tensor(self.entropy_loss_weight_q2)
 
             return loss, log
+        
+######################################################################################
+# Models : Auxiliary Supervision using Depth
+######################################################################################
 
 class VQLPIPSWithDiscriminator_depth(VQLPIPSWithDiscriminator):
     def __init__(
@@ -584,6 +600,10 @@ class VQLPIPSWithDiscriminator_depth(VQLPIPSWithDiscriminator):
                 log[f"{split}/entropy_loss_weight_q2"] = torch.tensor(self.entropy_loss_weight_q2)
 
             return loss, log
+        
+######################################################################################
+# Models : Auxiliary Supervision using Dino
+######################################################################################
 
 class VQLPIPSWithDiscriminator_dino(VQLPIPSWithDiscriminator):
     def __init__(

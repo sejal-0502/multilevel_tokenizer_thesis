@@ -4,11 +4,11 @@ This repository hosts the code for tokenizers designed to preserve both semantic
 
 <table>
   <tr>
-    <td align="center"><img src="imgs/model_perf.png" width="400"/></td>
-    <td align="center"><img src="imgs/visuals.png" width="900"/></td>
+    <td align="center"><img src="imgs/model_perf.png" width="600"/></td>
+    <td align="center"><img src="imgs/visuals.png" width="600"/></td>
   </tr>
   <tr>
-    <td align="center">Figure 1 : Performance of tokenizer across all 4 axes</td>
+    <td align="center">Figure 1 : Performance of tokenizer across all 4 evaluation axes</td>
     <td align="center">Figuare 2 : Example Visuals for each tokenizer model</td>
   </tr>
 </table>
@@ -16,6 +16,7 @@ This repository hosts the code for tokenizers designed to preserve both semantic
 ## Contributions 
 
 We explore multiple self-supervised learning methods for designing a tokenizer that improves semantic quality without significantly degrading perceptual fidelity compared to a standard VQ-VAE baseline. The proposed tokenizers improve semantic and geometric representations, with auxiliary supervision methods showing the strongest generative performance.
+
 Overall, our experiments show that self-supervised approaches, including masking, temporal context modeling, knowledge distillation from strong pretrained priors, and EMA-stabilized supervision, can effectively balance semantic and perceptual objectives in tokenizer learning.
 
 ## Checkpoints & Results

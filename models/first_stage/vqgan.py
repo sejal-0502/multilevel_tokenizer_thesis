@@ -11,7 +11,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from util import instantiate_from_config
 
 ######################################################################################
-# Models : MAE, Temporal MAE, Distillation (DINO, Depth, RAFT), Temporal Compression
+# Models : Baseline, MAE
 ######################################################################################
 
 class VQModel(pl.LightningModule):
@@ -346,6 +346,9 @@ class VQModel_images(VQModel):
             x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
         return x.float()
 
+######################################################################################
+# Models : Auxiliary Supervision using RAFT
+######################################################################################
 
 class VQModel_1frame_motion(VQModel):
     """
@@ -567,6 +570,9 @@ class VQModel_2frame_motion(VQModel_1frame_motion):
         self.log("val/disp_loss", disp_loss,
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
+######################################################################################
+# Models : Auxiliary Supervision using Depth
+######################################################################################
 
 class VQModel_1frame_depth(VQModel):
     """
@@ -713,6 +719,10 @@ class VQModel_1frame_depth(VQModel):
         log["input"] = x
         log["reconstruction_t+1"] = xrec
         return log
+    
+######################################################################################
+# Models : Auxiliary Supervision using DINO
+######################################################################################
 
 class VQModel_1frame_dino(VQModel):
     """
@@ -863,6 +873,10 @@ class VQModel_1frame_dino(VQModel):
         log["input"] = x
         log["reconstruction_t+1"] = xrec
         return log
+    
+######################################################################################
+# Models : Temporal MAE
+######################################################################################
 
 class VQModel_multiframes(pl.LightningModule):
     """

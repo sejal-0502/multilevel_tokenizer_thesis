@@ -10,6 +10,10 @@ from typing import Tuple, Union
 from timm.models.vision_transformer import VisionTransformer
 from modules.warping import warp_features
 
+############################################################################################
+# Models : VQ-VAE Baseline Encoder, Auxiliary Supervision Encoder (DINO, Depth, RAFT, MIM)
+############################################################################################
+
 class VAEEncoder(nn.Module):
     def __init__(
         self, 
@@ -69,6 +73,10 @@ class VAEEncoder(nn.Module):
         h = h.permute(0, 2, 1).contiguous()
         h = h.reshape(h.shape[0], -1, img.size(2)//self.patch_size, img.size(3)//self.patch_size)
         return h
+    
+######################################################################################
+# Models : Fixed Masking setup Encoder
+######################################################################################
 
 class VisionTransformerWithPretrainedWts(VisionTransformer):
     def __init__(self, patch_size, img_size, mask_ratio, **kwargs):
@@ -78,7 +86,7 @@ class VisionTransformerWithPretrainedWts(VisionTransformer):
         """
         super().__init__(img_size=img_size,**kwargs)
         self.num_patches = (img_size // patch_size) ** 2
-        self.mask_ratio = mask_ratio
+        self.mask_ratio = mask_ratio                        # can be adjusted in config
 
         self.patch_embed.proj = nn.Conv2d(3, 768, kernel_size=patch_size, stride=patch_size)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
@@ -221,6 +229,10 @@ class Encoder_mae(nn.Module):
         h = h.reshape(h.shape[0], -1, img.size(2)//self.patch_size, img.size(3)//self.patch_size)
         return h, masked_indices
 
+######################################################################################
+# Models : Random Range Masking setup Encoder
+######################################################################################
+
 class VisionTransformerWithPretrainedWts_randomMasking(VisionTransformer):
     def __init__(self, patch_size, img_size, mask_ratio, mask_ratio_min, mask_ratio_max, **kwargs):
         """
@@ -252,6 +264,7 @@ class VisionTransformerWithPretrainedWts_randomMasking(VisionTransformer):
         x = self.norm(x)
 
         return x
+    
 
 class Encoder_randommasking(nn.Module):
     """Encoder : random range masking"""
@@ -325,44 +338,10 @@ class Encoder_randommasking(nn.Module):
         h = h.permute(0, 2, 1).contiguous()
         h = h.reshape(h.shape[0], -1, img.size(2)//self.patch_size, img.size(3)//self.patch_size)
         return h
-
-class VisionTransformerWithPretrainedWtsMultiframes(VisionTransformer):
-    def __init__(self, patch_size, img_size, mask_ratio, **kwargs):
-        """
-        pretrained_cfg: pass the same kwargs you’d pass to timm.create_model
-
-        """
-        super().__init__(img_size=img_size,**kwargs)
-        self.num_patches = (img_size // patch_size) ** 2
-        self.mask_ratio = mask_ratio
-
-        self.patch_embed.proj = nn.Conv2d(3, 768, kernel_size=patch_size, stride=patch_size)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim))
-
-    def forward_features(self, x1, x2, mask_ratio):
-        x1 = self.patch_embed.proj(x1) 
-        x2 = self.patch_embed.proj(x2)   
-
-        x1 = x1.flatten(2).transpose(1, 2)   # [B, N, D]
-        x2 = x2.flatten(2).transpose(1, 2)   # [B, N, D]
-
-        x_masked, masks, masked_indices = mask_tokens(x2, mask_ratio, self.mask_token) 
-        # print("Shape of masked version of img : ", x_masked.shape)
-        
-        x1 = x1 + self.pos_embed.to(x1.device)
-        x_masked = x_masked + self.pos_embed.to(x_masked.device)
-
-        x = torch.cat([x1, x_masked], dim=1)
-
-        for blk in self.blocks:
-            x = blk(x)
-
-        x = self.norm(x)
-
-        x2 = x[:, self.num_patches:]
-
-        return x2
+    
+######################################################################################
+# Models : Temporal MAE (Heavy Random Range Masking)
+######################################################################################
     
 class VisionTransformerWithPretrainedWtsMultiframesRandomRange(VisionTransformer):
     def __init__(self, patch_size, img_size, mask_ratio, **kwargs):
@@ -477,99 +456,9 @@ class Encoder_multiframes(nn.Module):
         h = h.reshape(h.shape[0], -1, img2.size(2)//self.patch_size, img2.size(3)//self.patch_size)
         return h
 
-class VisionTransformerWithPretrainedWtsMultiframes_2dgrid(VisionTransformer):
-    def __init__(self, patch_size, img_size, mask_ratio, **kwargs):
-        """
-        pretrained_cfg: pass the same kwargs you’d pass to timm.create_model
-
-        """
-        super().__init__(img_size=img_size,**kwargs)
-        self.num_patches = (img_size // patch_size) ** 2
-        self.mask_ratio = mask_ratio
-        self.grid_size = patch_size
-        self.num_latents = self.grid_size ** 2
-
-        self.patch_embed.proj = nn.Conv2d(3, 768, kernel_size=patch_size, stride=patch_size)
-        self.latent_grid = nn.Parameter(torch.zeros(1, self.embed_dim, self.grid_size, self.grid_size))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 2*self.num_patches+self.num_latents, self.embed_dim))
-
-    def forward_features(self, x1, x2, mask_ratio):
-        B, C, H, W = x1.shape
-
-        x1 = self.patch_embed.proj(x1) 
-        x2 = self.patch_embed.proj(x2)   
-
-        x1 = x1.flatten(2).transpose(1, 2)   # [B, N, D]
-        x2 = x2.flatten(2).transpose(1, 2)   # [B, N, D]
-
-        grid = self.latent_grid.expand(B, -1, -1, -1)
-        grid = grid.flatten(2).transpose(1, 2)
-
-        x = torch.cat([x1, x2, grid], dim=1)
-        x = x + self.pos_embed.to(x1.device)
-
-        for blk in self.blocks:
-            x = blk(x)
-
-        x = self.norm(x)
-
-        latent_grid = x[:, self.num_patches+self.num_patches:]
-
-        return latent_grid
-
-class Encoder_multiframes_2dgrid(nn.Module):
-    """
-        Titok experiment but now with 2d grid like learnable canvas with 2 input frames unmasked
-    """
-    def __init__(
-        self, 
-        mask_ratio,
-        resolution: Union[Tuple[int, int], int], 
-        channels: int = 3, 
-        pretrained_encoder = 'MAE',
-        patch_size: int = 16,
-        z_channels: int = 768,
-        e_dim: int = 8,
-        normalize_embedding: bool = True,
-        # **ignore_kwargs
-    ) -> None:
-        # Initialize parent class with the first patch size
-        super().__init__()
-        self.image_size = resolution
-        self.patch_size = patch_size
-        self.channels = channels
-        self.normalize_embedding = normalize_embedding
-        self.z_channels = z_channels
-        self.e_dim = e_dim
-        self.mask_ratio = mask_ratio
-        self.num_latent_tokens = patch_size**2
-        
-        self.init_transformer(pretrained_encoder)
-
-    def init_transformer(self, pretrained_encoder):
-        if pretrained_encoder == 'MAE':
-            pretrained_encoder_model = 'timm/vit_base_patch16_224.mae'
-       
-        pretrained_model = timm.create_model(pretrained_encoder_model, img_size=self.image_size, patch_size=self.patch_size, pretrained=True)
-        state_dict = pretrained_model.state_dict()
-        self.encoder = VisionTransformerWithPretrainedWtsMultiframes_2dgrid(patch_size=self.patch_size, img_size=self.image_size, 
-                                                          mask_ratio=self.mask_ratio) 
-        
-        K = self.num_latent_tokens
-        state_dict['pos_embed'] = nn.Parameter(torch.zeros(1, 2*(state_dict['pos_embed'].shape[1]-1)+K, 768))
-
-        missing, unexpected = self.encoder.load_state_dict(state_dict, strict=False)
-
-        print(f"Loaded with {len(missing)} missing keys and {len(unexpected)} unexpected keys")
-        print("Missing keys:")
-        print(missing)
-        print("Unexpected Keys: ")
-        print(unexpected)
-    
-    def forward(self, img1: torch.FloatTensor, img2: torch.FloatTensor) -> torch.FloatTensor:
-        h = self.encoder.forward_features(img1, img2, self.mask_ratio)
-        h = h.reshape(h.shape[0], -1, img2.size(2)//self.patch_size, img2.size(3)//self.patch_size)
-        return h
+######################################################################################
+# Models : Temporal MAE (Asymmetric Masking - Tube Masking)
+######################################################################################
 
 class VisionTransformerWithPretrainedWtsMultiframes_tmasked(VisionTransformer):
     def __init__(self, patch_size, img_size, mask_ratio_f1, mask_ratio_f2, **kwargs):

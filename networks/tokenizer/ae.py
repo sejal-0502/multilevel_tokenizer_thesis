@@ -886,7 +886,7 @@ class RAFT_displacement(nn.Module):
     
 
 ###############################################################################
-# Decoder - MAE, Temporal MAE, Distillation
+# Decoder - Baseline, MAE, Temporal MAE, Auxiliary Supervision
 ###############################################################################
 
 class Decoder(nn.Module):
@@ -994,6 +994,10 @@ class Decoder(nn.Module):
         h = self.conv_out(h)
 
         return h
+    
+######################################################################################
+# Models : EMA supervision in decoder feature space
+######################################################################################
     
 class Decoder_decoderbased(Decoder):
     def __init__(self, *, resolution, patch_size, z_channels, **kwargs):

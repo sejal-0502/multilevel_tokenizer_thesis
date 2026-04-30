@@ -92,7 +92,6 @@ def mask_tokens_discard(x, mask_ratio):
     return x_visible, mask.float(), mask_indices
 
 
-
 def tube_mask_two_frames(x1, x2, mask_ratio_frame1, mask_ratio_frame2, mask_token):
     """
     Tube masking for 2-frame MAE setup.
