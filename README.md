@@ -5,7 +5,7 @@ This repository hosts the code for tokenizers designed to preserve both semantic
 <table>
   <tr>
     <td align="center"><img src="imgs/model_perf.png" width="600"/></td>
-    <td align="center"><img src="imgs/visuals.png" width="600"/></td>
+    <td align="center"><img src="imgs/visuals.png" width="1000"/></td>
   </tr>
   <tr>
     <td align="center">Figure 1 : Performance of tokenizer across all 4 evaluation axes</td>
