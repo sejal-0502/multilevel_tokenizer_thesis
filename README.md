@@ -82,4 +82,4 @@ python evaluate/compute_codebook_usage_dit.py --config_path /work/dlclarge2/muta
 ```
 # python evaluate/depth.py --ckpt /work/dlclarge2/mutakeks-titok/Thesis/mae_orbis/baseline/checkpoints/last.ckpt --config /work/dlclarge2/mutakeks-titok/Thesis/mae_orbis/baseline/config.yaml --split_dir evaluate/data --dump_vis True 
 ```
-> *Note: For 2 frame setups (like Temporal MAE), '--num_input_frames' needs to be set manually to 2 for probe scripts. The code defauls to 1 input frame only.*
+> *Note: For 2 frame setups (like Temporal MAE), '--num_input_frames' needs to be set manually to 2 for probe scripts. The code defaults to 1 input frame only.*
